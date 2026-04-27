@@ -14,6 +14,7 @@ from psycopg2.extras import RealDictCursor
 
 from config import settings
 from db import get_connection, get_cursor, init_db
+from agents import orchestrate, get_chat_history, alert_agent
 
 def create_app():
     app = Flask(__name__)
@@ -528,6 +529,50 @@ def create_app():
                 continue
 
         return sorted(ranked_articles, key=lambda x: x.get('impact_score', 0), reverse=True)
+
+    # -------------- Agentic Chat Routes --------------
+
+    @app.route('/chat', methods=['POST'])
+    def chat():
+        """
+        Main chat endpoint — routes to specialist agents.
+        Body: {"user_id": "uuid", "message": "your question"}
+        """
+        data    = request.get_json()
+        user_id = data.get('user_id')
+        message = data.get('message')
+
+        if not user_id or not message:
+            return jsonify({"error": "user_id and message are required"}), 400
+
+        try:
+            result = orchestrate(user_id, message)
+            return jsonify({
+                "response":   result["response"],
+                "agent_used": result["agent_used"],
+                "symbol":     result["symbol"],
+            }), 200
+        except Exception as e:
+            app.logger.error(f"Chat error: {e}")
+            return jsonify({"error": str(e)}), 500
+
+    @app.route('/chat/history/<user_id>', methods=['GET'])
+    def chat_history(user_id):
+        """Get conversation history for a user."""
+        try:
+            history = get_chat_history(user_id, limit=20)
+            return jsonify({"history": history}), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route('/chat/alerts/<user_id>', methods=['GET'])
+    def get_alerts(user_id):
+        """Get proactive portfolio alerts for a user."""
+        try:
+            alerts = alert_agent(user_id, "Check my portfolio for any alerts")
+            return jsonify({"alerts": alerts}), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     return app
 
