@@ -530,6 +530,80 @@ def create_app():
 
         return sorted(ranked_articles, key=lambda x: x.get('impact_score', 0), reverse=True)
 
+
+    # -------------- yfinance Routes (unlimited, no API key) --------------
+
+    @app.route('/stocks/yf/quote', methods=['GET'])
+    def get_yf_quote():
+        symbol = request.args.get('symbol')
+        if not symbol:
+            return jsonify({'error': 'Please provide symbol'}), 400
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(symbol.upper())
+            info = ticker.fast_info
+            return jsonify({
+                'symbol':     symbol.upper(),
+                'price':      round(float(info.last_price or 0), 2),
+                'prev_close': round(float(info.previous_close or 0), 2),
+                'change_pct': round(((info.last_price - info.previous_close) / info.previous_close * 100), 2) if info.previous_close else 0,
+                'volume':     int(info.three_month_average_volume or 0),
+                'high':       round(float(info.day_high or 0), 2),
+                'low':        round(float(info.day_low or 0), 2),
+            })
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/stocks/yf/history', methods=['GET'])
+    def get_yf_history():
+        symbol   = request.args.get('symbol')
+        period   = request.args.get('period', '3mo')
+        interval = request.args.get('interval', '1d')
+        if not symbol:
+            return jsonify({'error': 'Please provide symbol'}), 400
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(symbol.upper())
+            hist = ticker.history(period=period, interval=interval)
+            if hist.empty:
+                return jsonify({'error': 'No data found'}), 404
+            data = []
+            for date, row in hist.iterrows():
+                data.append({
+                    'time':   str(date)[:10],
+                    'open':   round(float(row['Open']), 2),
+                    'high':   round(float(row['High']), 2),
+                    'low':    round(float(row['Low']), 2),
+                    'close':  round(float(row['Close']), 2),
+                    'volume': int(row['Volume']),
+                })
+            return jsonify({'symbol': symbol.upper(), 'data': data})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/stocks/yf/multi', methods=['GET'])
+    def get_yf_multi():
+        symbols = request.args.get('symbols', '')
+        if not symbols:
+            return jsonify({'error': 'Please provide symbols'}), 400
+        try:
+            import yfinance as yf
+            tickers = yf.Tickers(symbols.upper())
+            result = {}
+            for sym in symbols.upper().split():
+                try:
+                    info = tickers.tickers[sym].fast_info
+                    result[sym] = {
+                        'price':      round(float(info.last_price or 0), 2),
+                        'prev_close': round(float(info.previous_close or 0), 2),
+                        'change_pct': round(((info.last_price - info.previous_close) / info.previous_close * 100), 2) if info.previous_close else 0,
+                    }
+                except:
+                    result[sym] = {'price': 0, 'prev_close': 0, 'change_pct': 0}
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
     # -------------- Agentic Chat Routes --------------
 
     @app.route('/chat', methods=['POST'])
