@@ -604,6 +604,133 @@ def create_app():
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
+
+    # -------------- Market News Routes --------------
+
+    @app.route('/stocks/news/market', methods=['GET'])
+    def get_market_news():
+        """Get broad market news across top tickers using yfinance."""
+        try:
+            import yfinance as yf
+            all_news = []
+            seen = set()
+            for sym in ["AAPL","NVDA","MSFT","GOOGL","META","TSLA","AMZN","SPY","JPM","NFLX"]:
+                try:
+                    ticker = yf.Ticker(sym)
+                    try:
+                        news_items = ticker.get_news(count=3)
+                    except:
+                        news_items = []
+                    if not news_items:
+                        try:
+                            news_items = ticker.news or []
+                        except:
+                            news_items = []
+                    for item in news_items[:3]:
+                        content = item.get("content", {})
+                        if content:
+                            title  = content.get("title", "")
+                            source = content.get("provider", {}).get("displayName", "")
+                            url    = content.get("canonicalUrl", {}).get("url", "#")
+                            thumb  = content.get("thumbnail", {}).get("originalUrl", "")
+                            pub    = content.get("pubDate", "")
+                        else:
+                            title  = item.get("title", "")
+                            source = item.get("publisher", "")
+                            url    = item.get("link", "#")
+                            thumb  = ""
+                            pub    = str(item.get("providerPublishTime", ""))
+                        if title and title not in seen:
+                            seen.add(title)
+                            all_news.append({
+                                "title":     title,
+                                "source":    source,
+                                "url":       url,
+                                "published": pub,
+                                "symbol":    sym,
+                                "thumbnail": thumb,
+                            })
+                except Exception as e:
+                    app.logger.error(f"News fetch error for {sym}: {e}")
+                    continue
+            return jsonify({"articles": all_news[:30]})
+        except Exception as e:
+            return jsonify({"error": str(e), "articles": []}), 500
+
+    @app.route('/stocks/news/ticker', methods=['GET'])
+    def get_ticker_headlines():
+        """Get short headlines for the scrolling ticker tape."""
+        try:
+            import yfinance as yf
+            headlines = []
+            for sym in ["AAPL","NVDA","MSFT","GOOGL","TSLA","META","AMZN","SPY","JPM","NFLX"]:
+                try:
+                    ticker = yf.Ticker(sym)
+                    try:
+                        news = ticker.get_news(count=1)
+                    except:
+                        news = ticker.news or []
+                    if news:
+                        item    = news[0]
+                        content = item.get("content", {})
+                        title   = content.get("title","") if content else item.get("title","")
+                        url     = content.get("canonicalUrl",{}).get("url","#") if content else item.get("link","#")
+                        if title:
+                            headlines.append({
+                                "symbol": sym,
+                                "title":  title[:90],
+                                "url":    url,
+                            })
+                except:
+                    continue
+            return jsonify({"headlines": headlines})
+        except Exception as e:
+            return jsonify({"error": str(e), "headlines": []}), 500
+
+
+    @app.route('/stocks/yf/news', methods=['GET'])
+    def get_yf_news():
+        """Get stock-specific news using yfinance — no rate limits."""
+        symbol = request.args.get('symbol')
+        if not symbol:
+            return jsonify({'error': 'Please provide symbol'}), 400
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(symbol.upper())
+            try:
+                news_items = ticker.get_news(count=10)
+            except:
+                news_items = ticker.news or []
+            articles = []
+            for item in news_items[:10]:
+                content_data = item.get("content", {})
+                if content_data:
+                    title  = content_data.get("title", "")
+                    source = content_data.get("provider", {}).get("displayName", "")
+                    url    = content_data.get("canonicalUrl", {}).get("url", "#")
+                    thumb  = content_data.get("thumbnail", {}).get("originalUrl", "")
+                    pub    = content_data.get("pubDate", "")
+                else:
+                    title  = item.get("title", "")
+                    source = item.get("publisher", "")
+                    url    = item.get("link", "#")
+                    thumb  = ""
+                    pub    = str(item.get("providerPublishTime", ""))
+                if title:
+                    articles.append({
+                        "title":     title,
+                        "source":    source,
+                        "url":       url,
+                        "published": pub,
+                        "symbol":    symbol.upper(),
+                        "thumbnail": thumb,
+                        "overall_sentiment_label": "Neutral",
+                        "overall_sentiment_score": "0",
+                    })
+            return jsonify({"articles": articles})
+        except Exception as e:
+            return jsonify({"error": str(e), "articles": []}), 500
+
     # -------------- Agentic Chat Routes --------------
 
     @app.route('/chat', methods=['POST'])
