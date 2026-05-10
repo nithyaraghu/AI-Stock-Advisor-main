@@ -243,6 +243,32 @@ def create_app():
             cur.close()
             conn.close()
 
+
+    @app.route('/portfolio/<email>/<symbol>', methods=['DELETE'])
+    def delete_holding(email, symbol):
+        """Delete a single stock from portfolio."""
+        conn = get_connection()
+        cur  = get_cursor(conn)
+        try:
+            cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+            user = cur.fetchone()
+            if not user:
+                return jsonify({"message": "User not found"}), 404
+            cur2 = conn.cursor()
+            cur2.execute(
+                "DELETE FROM portfolio_holdings WHERE user_id = %s AND symbol = %s",
+                (str(user['id']), symbol.upper())
+            )
+            conn.commit()
+            cur2.close()
+            return jsonify({"message": f"{symbol} removed from portfolio"}), 200
+        except Exception as e:
+            conn.rollback()
+            return jsonify({"message": "Error removing stock", "error": str(e)}), 500
+        finally:
+            cur.close()
+            conn.close()
+
     # -------------- Stock Routes --------------
 
     @cache.cached()
