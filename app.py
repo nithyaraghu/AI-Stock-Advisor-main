@@ -159,13 +159,14 @@ def create_app():
             portfolio = cur.fetchall()
 
             return jsonify({
-                "email": user['email'],
+                "userId":   str(user['id']),
+                "email":    user['email'],
                 "username": user['name'],
-                "gender": prefs.get('gender'),
-                "age": prefs.get('age'),
+                "gender":   prefs.get('gender'),
+                "age":      prefs.get('age'),
                 "investmentGoal": prefs.get('investmentGoal'),
-                "riskAppetite": prefs.get('riskAppetite'),
-                "timeHorizon": prefs.get('timeHorizon'),
+                "riskAppetite":   prefs.get('riskAppetite'),
+                "timeHorizon":    prefs.get('timeHorizon'),
                 "portfolio": [dict(p) for p in portfolio]
             }), 200
 
@@ -743,10 +744,16 @@ def create_app():
         user_id = data.get('user_id')
         message = data.get('message')
 
-        if not user_id or not message:
-            return jsonify({"error": "user_id and message are required"}), 400
+        if not message:
+            return jsonify({"error": "message is required"}), 400
+        # Use anonymous UUID if user_id is missing or looks like an email
+        import re
+        uuid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+        if not user_id or not uuid_pattern.match(str(user_id)):
+            user_id = "00000000-0000-0000-0000-000000000001"
 
         try:
+            import traceback
             result = orchestrate(user_id, message)
             return jsonify({
                 "response":   result["response"],
@@ -754,8 +761,9 @@ def create_app():
                 "symbol":     result["symbol"],
             }), 200
         except Exception as e:
-            app.logger.error(f"Chat error: {e}")
-            return jsonify({"error": str(e)}), 500
+            tb = traceback.format_exc()
+            app.logger.error(f"Chat error: {e}\n{tb}")
+            return jsonify({"error": str(e), "detail": tb[-500:]}), 500
 
     @app.route('/chat/history/<user_id>', methods=['GET'])
     def chat_history(user_id):
