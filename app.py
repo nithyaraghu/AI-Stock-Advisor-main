@@ -26,14 +26,11 @@ def create_app():
     # ------------- Logging ------------------
     @app.before_request
     def log_request_info():
-        app.logger.debug('--- Incoming Request ---')
-        app.logger.debug('Request Method: %s', request.method)
-        app.logger.debug('Request URL: %s', request.url)
+        app.logger.debug('Request: %s %s', request.method, request.url)
 
     @app.after_request
     def log_response_info(response):
-        app.logger.debug('--- Outgoing Response ---')
-        app.logger.debug('Response Status: %s', response.status)
+        app.logger.debug('Response: %s', response.status)
         return response
 
     # -------------- PostgreSQL Init --------------
@@ -65,7 +62,8 @@ def create_app():
         risk_appetite = data.get('riskAppetite')
         time_horizon = data.get('timeHorizon')
 
-        # Hash the password
+        # Password arrives pre-hashed (SHA-256) from client
+        # We bcrypt it again for storage: bcrypt(sha256(plaintext))
         hashed_password = bcrypt.hashpw(
             password.encode('utf-8'), bcrypt.gensalt()
         ).decode('utf-8')
@@ -119,11 +117,15 @@ def create_app():
             if not user:
                 return jsonify({"message": "User not found"}), 400
 
-            if not bcrypt.checkpw(
-                password.encode('utf-8'),
-                user['password'].encode('utf-8')
-            ):
-                return jsonify({"message": "Invalid credentials"}), 400
+            try:
+                pwd_match = bcrypt.checkpw(
+                    password.encode('utf-8'),
+                    user['password'].encode('utf-8')
+                )
+            except Exception:
+                pwd_match = False
+            if not pwd_match:
+                return jsonify({"message": "Invalid email or password"}), 400
 
             return jsonify({
                 "message": "Login successful",
@@ -480,6 +482,10 @@ def create_app():
         response.headers.add('Access-Control-Allow-Origin', '*')
         response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
         response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS,DELETE')
+        # Security headers
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
+        response.headers['Cache-Control'] = 'no-store'
         return response
 
     # -------------- ML Processing Routes --------------
