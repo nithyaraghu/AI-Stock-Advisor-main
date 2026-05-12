@@ -659,20 +659,21 @@ def create_app():
                             news_items = ticker.news or []
                         except:
                             news_items = []
-                    for item in news_items[:3]:
-                        content = item.get("content", {})
-                        if content:
-                            title  = content.get("title", "")
-                            source = content.get("provider", {}).get("displayName", "")
-                            url    = content.get("canonicalUrl", {}).get("url", "#")
-                            thumb  = content.get("thumbnail", {}).get("originalUrl", "")
-                            pub    = content.get("pubDate", "")
+                    for item in (news_items or [])[:3]:
+                        if not item or not isinstance(item, dict): continue
+                        content = item.get("content", {}) or {}
+                        if content and isinstance(content, dict):
+                            title  = content.get("title", "") or ""
+                            source = (content.get("provider") or {}).get("displayName", "") or ""
+                            url    = (content.get("canonicalUrl") or {}).get("url", "#") or "#"
+                            thumb  = (content.get("thumbnail") or {}).get("originalUrl", "") or ""
+                            pub    = content.get("pubDate", "") or ""
                         else:
-                            title  = item.get("title", "")
-                            source = item.get("publisher", "")
-                            url    = item.get("link", "#")
+                            title  = item.get("title", "") or ""
+                            source = item.get("publisher", "") or ""
+                            url    = item.get("link", "#") or "#"
                             thumb  = ""
-                            pub    = str(item.get("providerPublishTime", ""))
+                            pub    = str(item.get("providerPublishTime", "") or "")
                         if title and title not in seen:
                             seen.add(title)
                             all_news.append({
@@ -735,31 +736,35 @@ def create_app():
             except:
                 news_items = ticker.news or []
             articles = []
-            for item in news_items[:10]:
-                content_data = item.get("content", {})
-                if content_data:
-                    title  = content_data.get("title", "")
-                    source = content_data.get("provider", {}).get("displayName", "")
-                    url    = content_data.get("canonicalUrl", {}).get("url", "#")
-                    thumb  = content_data.get("thumbnail", {}).get("originalUrl", "")
-                    pub    = content_data.get("pubDate", "")
-                else:
-                    title  = item.get("title", "")
-                    source = item.get("publisher", "")
-                    url    = item.get("link", "#")
-                    thumb  = ""
-                    pub    = str(item.get("providerPublishTime", ""))
-                if title:
-                    articles.append({
-                        "title":     title,
-                        "source":    source,
-                        "url":       url,
-                        "published": pub,
-                        "symbol":    symbol.upper(),
-                        "thumbnail": thumb,
-                        "overall_sentiment_label": "Neutral",
-                        "overall_sentiment_score": "0",
-                    })
+            for item in (news_items or [])[:10]:
+                if not item or not isinstance(item, dict): continue
+                try:
+                    content_data = item.get("content") or {}
+                    if content_data and isinstance(content_data, dict):
+                        title  = content_data.get("title", "") or ""
+                        source = (content_data.get("provider") or {}).get("displayName", "") or ""
+                        url    = (content_data.get("canonicalUrl") or {}).get("url", "#") or "#"
+                        thumb  = (content_data.get("thumbnail") or {}).get("originalUrl", "") or ""
+                        pub    = content_data.get("pubDate", "") or ""
+                    else:
+                        title  = item.get("title", "") or ""
+                        source = item.get("publisher", "") or ""
+                        url    = item.get("link", "#") or "#"
+                        thumb  = ""
+                        pub    = str(item.get("providerPublishTime", "") or "")
+                    if title:
+                        articles.append({
+                            "title":     title,
+                            "source":    source,
+                            "url":       url,
+                            "published": pub,
+                            "symbol":    symbol.upper(),
+                            "thumbnail": thumb,
+                            "overall_sentiment_label": "Neutral",
+                            "overall_sentiment_score": "0",
+                        })
+                except Exception:
+                    continue
             return jsonify({"articles": articles})
         except Exception as e:
             return jsonify({"error": str(e), "articles": []}), 500
