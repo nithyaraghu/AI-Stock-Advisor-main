@@ -59,3 +59,4 @@ watchfiles==0.24.0
 websockets==14.1
 Werkzeug==2.3.6
 zipp==3.21.0
+gunicorn
