@@ -17,3 +17,4 @@ python-dateutil==2.9.0.post0
 pytz==2024.2
 urllib3==2.2.1
 certifi==2024.8.30
+flask-caching==2.3.0
