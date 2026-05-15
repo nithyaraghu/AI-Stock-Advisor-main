@@ -201,16 +201,21 @@ def create_app():
         try:
             POLYGON_KEY = os.environ.get('POLYGON_API_KEY', '')
             if POLYGON_KEY:
-                # Use Polygon prev day aggs (works on free tier)
-                url = f"https://api.polygon.io/v2/aggs/ticker/{symbol.upper()}/prev?adjusted=true&apiKey={POLYGON_KEY}"
-                r = requests.get(url, timeout=10).json()
-                res = r.get('results', [{}])[0] if r.get('results') else {}
-                price = res.get('c', 0)  # close price
-                prev  = res.get('o', price)  # open price
-                high  = res.get('h', 0)
-                low   = res.get('l', 0)
-                vol   = res.get('v', 0)
-                chg   = round(((price - prev) / prev * 100), 2) if prev else 0
+                # Try snapshot first (most accurate current price)
+                snap_url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{symbol.upper()}?apiKey={POLYGON_KEY}"
+                snap_r = requests.get(snap_url, timeout=10).json()
+                ticker_data = snap_r.get('ticker', {})
+                day = ticker_data.get('day', {})
+                prev_day = ticker_data.get('prevDay', {})
+                last_trade = ticker_data.get('lastTrade', {})
+
+                price = last_trade.get('p', 0) or day.get('c', 0)
+                prev  = prev_day.get('c', 0)
+                high  = day.get('h', 0)
+                low   = day.get('l', 0)
+                vol   = day.get('v', 0)
+                chg   = round(((price - prev) / prev * 100), 2) if prev and price else 0
+
                 if price > 0:
                     return jsonify({
                         'symbol': symbol.upper(),
@@ -220,6 +225,24 @@ def create_app():
                         'volume': int(vol),
                         'high': round(float(high), 2),
                         'low': round(float(low), 2),
+                    })
+
+                # Fallback: prev day aggs
+                url = f"https://api.polygon.io/v2/aggs/ticker/{symbol.upper()}/prev?adjusted=true&apiKey={POLYGON_KEY}"
+                r = requests.get(url, timeout=10).json()
+                res = r.get('results', [{}])[0] if r.get('results') else {}
+                price = res.get('c', 0)
+                prev  = res.get('o', price)
+                chg   = round(((price - prev) / prev * 100), 2) if prev else 0
+                if price > 0:
+                    return jsonify({
+                        'symbol': symbol.upper(),
+                        'price': round(float(price), 2),
+                        'prev_close': round(float(prev), 2),
+                        'change_pct': chg,
+                        'volume': int(res.get('v', 0)),
+                        'high': round(float(res.get('h', 0)), 2),
+                        'low': round(float(res.get('l', 0)), 2),
                     })
             # Fallback to yfinance
             import yfinance as yf
