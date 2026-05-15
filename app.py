@@ -201,6 +201,53 @@ def create_app():
         try:
             POLYGON_KEY = os.environ.get('POLYGON_API_KEY', '')
             if POLYGON_KEY:
+                try:
+                    # Try snapshot first for real-time price
+                    snap_url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{symbol.upper()}?apiKey={POLYGON_KEY}"
+                    snap_r = requests.get(snap_url, timeout=10).json()
+                    ticker_data = snap_r.get('ticker', {})
+                    if ticker_data:
+                        day = ticker_data.get('day', {})
+                        prev_day = ticker_data.get('prevDay', {})
+                        last_trade = ticker_data.get('lastTrade', {})
+                        price = last_trade.get('p', 0) or day.get('c', 0)
+                        prev  = prev_day.get('c', 0)
+                        if price > 0:
+                            chg = round(((price - prev) / prev * 100), 2) if prev else 0
+                            return jsonify({
+                                'symbol': symbol.upper(),
+                                'price': round(float(price), 2),
+                                'prev_close': round(float(prev), 2),
+                                'change_pct': chg,
+                                'volume': int(day.get('v', 0)),
+                                'high': round(float(day.get('h', 0)), 2),
+                                'low': round(float(day.get('l', 0)), 2),
+                            })
+                except Exception:
+                    pass
+                try:
+                    # Fallback: prev day aggs
+                    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol.upper()}/prev?adjusted=true&apiKey={POLYGON_KEY}"
+                    r = requests.get(url, timeout=10).json()
+                    res = r.get('results', [{}])[0] if r.get('results') else {}
+                    price = res.get('c', 0)
+                    prev  = res.get('o', price)
+                    if price > 0:
+                        chg = round(((price - prev) / prev * 100), 2) if prev else 0
+                        return jsonify({
+                            'symbol': symbol.upper(),
+                            'price': round(float(price), 2),
+                            'prev_close': round(float(prev), 2),
+                            'change_pct': chg,
+                            'volume': int(res.get('v', 0)),
+                            'high': round(float(res.get('h', 0)), 2),
+                            'low': round(float(res.get('l', 0)), 2),
+                        })
+                except Exception:
+                    pass
+            # Fallback to yfinance
+            POLYGON_KEY_UNUSED = None  # skip to yfinance
+            if POLYGON_KEY:
                 # Try snapshot first (most accurate current price)
                 snap_url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{symbol.upper()}?apiKey={POLYGON_KEY}"
                 snap_r = requests.get(snap_url, timeout=10).json()
@@ -245,17 +292,24 @@ def create_app():
                         'low': round(float(res.get('l', 0)), 2),
                     })
             # Fallback to yfinance
-            import yfinance as yf
-            info = yf.Ticker(symbol.upper()).fast_info
-            return jsonify({
-                'symbol': symbol.upper(),
-                'price': round(float(info.last_price or 0), 2),
-                'prev_close': round(float(info.previous_close or 0), 2),
-                'change_pct': round(((info.last_price - info.previous_close) / info.previous_close * 100), 2) if info.previous_close else 0,
-                'volume': int(info.three_month_average_volume or 0),
-                'high': round(float(info.day_high or 0), 2),
-                'low': round(float(info.day_low or 0), 2),
-            })
+            try:
+                import yfinance as yf
+                ticker = yf.Ticker(symbol.upper())
+                info = ticker.fast_info
+                price = float(info.last_price or 0)
+                prev  = float(info.previous_close or 0)
+                chg   = round(((price - prev) / prev * 100), 2) if prev else 0
+                return jsonify({
+                    'symbol': symbol.upper(),
+                    'price': round(price, 2),
+                    'prev_close': round(prev, 2),
+                    'change_pct': chg,
+                    'volume': int(info.three_month_average_volume or 0),
+                    'high': round(float(info.day_high or 0), 2),
+                    'low': round(float(info.day_low or 0), 2),
+                })
+            except Exception:
+                return jsonify({'symbol': symbol.upper(), 'price': 0, 'prev_close': 0, 'change_pct': 0, 'volume': 0, 'high': 0, 'low': 0})
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
