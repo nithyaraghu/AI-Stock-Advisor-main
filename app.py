@@ -201,23 +201,26 @@ def create_app():
         try:
             POLYGON_KEY = os.environ.get('POLYGON_API_KEY', '')
             if POLYGON_KEY:
-                # Use Polygon for live quote
-                url = f"https://api.polygon.io/v2/last/trade/{symbol.upper()}?apiKey={POLYGON_KEY}"
-                prev_url = f"https://api.polygon.io/v2/aggs/ticker/{symbol.upper()}/prev?apiKey={POLYGON_KEY}"
-                r1 = requests.get(url, timeout=10).json()
-                r2 = requests.get(prev_url, timeout=10).json()
-                price = r1.get('results', {}).get('p', 0)
-                prev = r2.get('results', [{}])[0].get('c', price) if r2.get('results') else price
-                chg = round(((price - prev) / prev * 100), 2) if prev else 0
-                return jsonify({
-                    'symbol': symbol.upper(),
-                    'price': round(float(price), 2),
-                    'prev_close': round(float(prev), 2),
-                    'change_pct': chg,
-                    'volume': r2.get('results', [{}])[0].get('v', 0) if r2.get('results') else 0,
-                    'high': r2.get('results', [{}])[0].get('h', 0) if r2.get('results') else 0,
-                    'low': r2.get('results', [{}])[0].get('l', 0) if r2.get('results') else 0,
-                })
+                # Use Polygon prev day aggs (works on free tier)
+                url = f"https://api.polygon.io/v2/aggs/ticker/{symbol.upper()}/prev?adjusted=true&apiKey={POLYGON_KEY}"
+                r = requests.get(url, timeout=10).json()
+                res = r.get('results', [{}])[0] if r.get('results') else {}
+                price = res.get('c', 0)  # close price
+                prev  = res.get('o', price)  # open price
+                high  = res.get('h', 0)
+                low   = res.get('l', 0)
+                vol   = res.get('v', 0)
+                chg   = round(((price - prev) / prev * 100), 2) if prev else 0
+                if price > 0:
+                    return jsonify({
+                        'symbol': symbol.upper(),
+                        'price': round(float(price), 2),
+                        'prev_close': round(float(prev), 2),
+                        'change_pct': chg,
+                        'volume': int(vol),
+                        'high': round(float(high), 2),
+                        'low': round(float(low), 2),
+                    })
             # Fallback to yfinance
             import yfinance as yf
             info = yf.Ticker(symbol.upper()).fast_info
