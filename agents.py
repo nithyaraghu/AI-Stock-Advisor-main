@@ -13,7 +13,9 @@ from groq import Groq
 from db import get_connection, get_cursor
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-MODEL = "llama-3.3-70b-versatile"
+NEWS_API_KEY   = os.environ.get("NEWS_API_KEY", "")
+POLYGON_KEY    = os.environ.get("POLYGON_API_KEY", "")
+MODEL          = "llama-3.3-70b-versatile"
 EMAIL_SENDER   = os.environ.get("ALERT_EMAIL_SENDER")
 EMAIL_PASSWORD = os.environ.get("ALERT_EMAIL_PASSWORD")
 EMAIL_RECEIVER = os.environ.get("ALERT_EMAIL_RECEIVER")
@@ -100,25 +102,50 @@ def extract_and_save_preferences(user_id, message):
 # ── DATA & INDICATORS ─────────────────────────────────────────
 
 def fetch_stock_quote(symbol):
-    """Fetch live quote - uses Polygon if available, falls back to yfinance."""
-    try:
-        if POLYGON_KEY:
-            url = f"https://api.polygon.io/v2/aggs/ticker/{symbol.upper()}/prev?apiKey={POLYGON_KEY}"
+    """Fetch live quote — Finnhub first, Polygon fallback, yfinance last."""
+    sym = symbol.upper()
+    finnhub_key = os.environ.get("FINNHUB_API_KEY", "")
+    if finnhub_key:
+        try:
+            r = requests.get(
+                f"https://finnhub.io/api/v1/quote?symbol={sym}&token={finnhub_key}",
+                timeout=10).json()
+            price = float(r.get("c", 0) or 0)
+            prev  = float(r.get("pc", 0) or 0)
+            if price > 0:
+                return {"symbol": sym, "price": round(price, 2),
+                        "prev_close": round(prev, 2),
+                        "change_pct": round(((price-prev)/prev*100), 2) if prev else 0,
+                        "volume": 0}
+        except Exception:
+            pass
+    if POLYGON_KEY:
+        try:
+            url = f"https://api.polygon.io/v2/aggs/ticker/{sym}/prev?apiKey={POLYGON_KEY}"
             r   = requests.get(url, timeout=10).json()
             res = r.get("results", [{}])[0] if r.get("results") else {}
-            price = res.get("c", 0); prev = res.get("o", price)
-            return {"symbol": symbol.upper(), "price": round(float(price), 2),
-                    "prev_close": round(float(prev), 2),
-                    "change_pct": round(((price-prev)/prev*100), 2) if prev else 0,
-                    "volume": int(res.get("v", 0))}
+            price = float(res.get("c", 0) or 0)
+            prev  = float(res.get("o", price) or price)
+            if price > 0:
+                return {"symbol": sym, "price": round(price, 2),
+                        "prev_close": round(prev, 2),
+                        "change_pct": round(((price-prev)/prev*100), 2) if prev else 0,
+                        "volume": int(res.get("v", 0))}
+        except Exception:
+            pass
+    try:
         import yfinance as yf
-        info = yf.Ticker(symbol.upper()).fast_info
-        return {"symbol": symbol.upper(), "price": round(float(info.last_price or 0), 2),
-                "prev_close": round(float(info.previous_close or 0), 2),
-                "change_pct": round(((info.last_price-info.previous_close)/info.previous_close*100), 2) if info.previous_close else 0,
-                "volume": int(info.three_month_average_volume or 0)}
-    except Exception as e:
-        return {"error": str(e), "symbol": symbol, "price": 0}
+        info  = yf.Ticker(sym).fast_info
+        price = float(info.last_price or 0)
+        prev  = float(info.previous_close or 0)
+        if price > 0:
+            return {"symbol": sym, "price": round(price, 2),
+                    "prev_close": round(prev, 2),
+                    "change_pct": round(((price-prev)/prev*100), 2) if prev else 0,
+                    "volume": int(info.three_month_average_volume or 0)}
+    except Exception:
+        pass
+    return {"symbol": sym, "price": 0, "prev_close": 0, "change_pct": 0}
 
 
 def fetch_price_history(symbol, period="3mo"):
