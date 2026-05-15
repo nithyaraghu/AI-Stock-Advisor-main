@@ -51,13 +51,26 @@ def create_app():
 
     @app.route('/debug/env')
     def debug_env():
-        """Check environment variables are loaded (safe - only shows if keys exist, not values)."""
         return jsonify({
             'NEWS_API_KEY':    'SET' if os.environ.get('NEWS_API_KEY') else 'MISSING',
             'POLYGON_API_KEY': 'SET' if os.environ.get('POLYGON_API_KEY') else 'MISSING',
             'GROQ_API_KEY':    'SET' if os.environ.get('GROQ_API_KEY') else 'MISSING',
             'DATABASE_URL':    'SET' if os.environ.get('DATABASE_URL') else 'MISSING',
         })
+
+    @app.route('/debug/polygon')
+    def debug_polygon():
+        """Test Polygon API response."""
+        POLYGON_KEY = os.environ.get('POLYGON_API_KEY', '')
+        if not POLYGON_KEY:
+            return jsonify({'error': 'POLYGON_API_KEY not set'})
+        try:
+            # Test prev aggs
+            url = f"https://api.polygon.io/v2/aggs/ticker/AAPL/prev?adjusted=true&apiKey={POLYGON_KEY}"
+            r = requests.get(url, timeout=10).json()
+            return jsonify({'prev_aggs': r})
+        except Exception as e:
+            return jsonify({'error': str(e)})
 
     @app.route('/signup', methods=['POST'])
     def signup():
