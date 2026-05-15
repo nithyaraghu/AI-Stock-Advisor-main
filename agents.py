@@ -13,7 +13,6 @@ from groq import Groq
 from db import get_connection, get_cursor
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
 MODEL = "llama-3.3-70b-versatile"
 EMAIL_SENDER   = os.environ.get("ALERT_EMAIL_SENDER")
 EMAIL_PASSWORD = os.environ.get("ALERT_EMAIL_PASSWORD")
@@ -101,16 +100,23 @@ def extract_and_save_preferences(user_id, message):
 # ── DATA & INDICATORS ─────────────────────────────────────────
 
 def fetch_stock_quote(symbol):
+    """Fetch live quote - uses Polygon if available, falls back to yfinance."""
     try:
+        if POLYGON_KEY:
+            url = f"https://api.polygon.io/v2/aggs/ticker/{symbol.upper()}/prev?apiKey={POLYGON_KEY}"
+            r   = requests.get(url, timeout=10).json()
+            res = r.get("results", [{}])[0] if r.get("results") else {}
+            price = res.get("c", 0); prev = res.get("o", price)
+            return {"symbol": symbol.upper(), "price": round(float(price), 2),
+                    "prev_close": round(float(prev), 2),
+                    "change_pct": round(((price-prev)/prev*100), 2) if prev else 0,
+                    "volume": int(res.get("v", 0))}
         import yfinance as yf
         info = yf.Ticker(symbol.upper()).fast_info
-        return {
-            "symbol": symbol.upper(),
-            "price": round(float(info.last_price or 0), 2),
-            "prev_close": round(float(info.previous_close or 0), 2),
-            "change_pct": round(((info.last_price - info.previous_close) / info.previous_close * 100), 2) if info.previous_close else 0,
-            "volume": int(info.three_month_average_volume or 0),
-        }
+        return {"symbol": symbol.upper(), "price": round(float(info.last_price or 0), 2),
+                "prev_close": round(float(info.previous_close or 0), 2),
+                "change_pct": round(((info.last_price-info.previous_close)/info.previous_close*100), 2) if info.previous_close else 0,
+                "volume": int(info.three_month_average_volume or 0)}
     except Exception as e:
         return {"error": str(e), "symbol": symbol, "price": 0}
 
@@ -127,15 +133,26 @@ def fetch_price_history(symbol, period="3mo"):
         return []
 
 
+COMPANY_NAMES = {
+    'AAPL':'Apple','NVDA':'NVIDIA','MSFT':'Microsoft','GOOGL':'Alphabet Google',
+    'META':'Meta Platforms','AMZN':'Amazon','TSLA':'Tesla','AMD':'AMD',
+    'INTC':'Intel','JPM':'JPMorgan','BAC':'Bank of America','V':'Visa',
+    'MA':'Mastercard','NFLX':'Netflix','DIS':'Disney','COIN':'Coinbase',
+    'PYPL':'PayPal','UBER':'Uber','SHOP':'Shopify','PLTR':'Palantir',
+}
+
 def fetch_stock_news(symbol):
+    """Fetch stock news using NewsAPI - works on cloud servers."""
     try:
-        resp = requests.get("https://www.alphavantage.co/query",
-            params={"function": "NEWS_SENTIMENT", "tickers": symbol.upper(),
-                    "limit": 5, "apikey": ALPHA_VANTAGE_KEY}, timeout=10)
-        return [{"title": a.get("title"), "source": a.get("source"),
-                 "sentiment": a.get("overall_sentiment_label"),
-                 "score": float(a.get("overall_sentiment_score", 0))}
-                for a in resp.json().get("feed", [])[:5]]
+        if NEWS_API_KEY:
+            query = COMPANY_NAMES.get(symbol.upper(), symbol)
+            url   = f"https://newsapi.org/v2/everything?q={query}+stock&sortBy=publishedAt&pageSize=5&apiKey={NEWS_API_KEY}&language=en"
+            r     = requests.get(url, timeout=10).json()
+            return [{"title": a.get("title",""), "source": a.get("source",{}).get("name",""),
+                     "sentiment": "Neutral", "score": 0.0, "url": a.get("url","#")}
+                    for a in r.get("articles",[])[:5]
+                    if a.get("title") and "[Removed]" not in a.get("title","")]
+        return []
     except:
         return []
 

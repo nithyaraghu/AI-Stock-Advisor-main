@@ -21,9 +21,15 @@ def create_app():
     CORS(app, supports_credentials=True)
 
     cache = Cache(app, config={'CACHE_TYPE': 'SimpleCache', 'CACHE_DEFAULT_TIMEOUT': 300})
-    logging.basicConfig(level=logging.DEBUG)
+    # Only show warnings and errors - suppress yfinance debug spam
+    logging.basicConfig(level=logging.WARNING)
+    logging.getLogger('yfinance').setLevel(logging.ERROR)
+    logging.getLogger('urllib3').setLevel(logging.ERROR)
+    logging.getLogger('peewee').setLevel(logging.ERROR)
 
-    # ------------- Logging ------------------
+    # NewsAPI key for news endpoints
+    NEWS_API_KEY = os.environ.get('NEWS_API_KEY', '')
+
     @app.before_request
     def log_request_info():
         app.logger.debug('Request: %s %s', request.method, request.url)
@@ -33,14 +39,7 @@ def create_app():
         app.logger.debug('Response: %s', response.status)
         return response
 
-    # -------------- PostgreSQL Init --------------
-    # Replaces Cosmos DB initialization
     init_db()
-
-    # API Key
-    API_KEY = os.environ.get('ALPHA_VANTAGE_API_KEY', '9ZQUXAH9JOQRSQDV')
-
-    # -------------- Auth Routes --------------
 
     @app.route('/')
     def home():
@@ -48,7 +47,7 @@ def create_app():
 
     @app.errorhandler(404)
     def not_found(e):
-        return "<h1>404 Not Found</h1><p>The requested resource could not be found.</p>", 404
+        return "<h1>404 Not Found</h1>", 404
 
     @app.route('/signup', methods=['POST'])
     def signup():
@@ -56,59 +55,35 @@ def create_app():
         username = data.get('username')
         email = data.get('email')
         password = data.get('password')
-        gender = data.get('gender')
-        age = data.get('age')
-        investment_goal = data.get('investmentGoal')
-        risk_appetite = data.get('riskAppetite')
-        time_horizon = data.get('timeHorizon')
-
-        # Password arrives pre-hashed (SHA-256) from client
-        # We bcrypt it again for storage: bcrypt(sha256(plaintext))
-        hashed_password = bcrypt.hashpw(
-            password.encode('utf-8'), bcrypt.gensalt()
-        ).decode('utf-8')
-
+        hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
         conn = get_connection()
         cur = get_cursor(conn)
         try:
-            # Check if user already exists
             cur.execute("SELECT id FROM users WHERE email = %s", (email,))
             if cur.fetchone():
                 return jsonify({"message": "Email already exists"}), 400
-
-            # Insert new user
             cur.execute("""
-                INSERT INTO users
-                    (email, password, name, preferences)
+                INSERT INTO users (email, password, name, preferences)
                 VALUES (%s, %s, %s, %s)
-            """, (
-                email,
-                hashed_password,
-                username,
-                json.dumps({
-                    "gender": gender,
-                    "age": age,
-                    "investmentGoal": investment_goal,
-                    "riskAppetite": risk_appetite,
-                    "timeHorizon": time_horizon
-                })
-            ))
+            """, (email, hashed_password, username, json.dumps({
+                "gender": data.get('gender'), "age": data.get('age'),
+                "investmentGoal": data.get('investmentGoal'),
+                "riskAppetite": data.get('riskAppetite'),
+                "timeHorizon": data.get('timeHorizon')
+            })))
             conn.commit()
             return jsonify({"message": "User signed up successfully"}), 201
-
         except Exception as e:
             conn.rollback()
             return jsonify({"message": "Error creating user", "error": str(e)}), 500
         finally:
-            cur.close()
-            conn.close()
+            cur.close(); conn.close()
 
     @app.route('/login', methods=['POST'])
     def login():
         data = request.get_json()
         email = data.get('email')
         password = data.get('password')
-
         conn = get_connection()
         cur = get_cursor(conn)
         try:
@@ -116,30 +91,17 @@ def create_app():
             user = cur.fetchone()
             if not user:
                 return jsonify({"message": "User not found"}), 400
-
             try:
-                pwd_match = bcrypt.checkpw(
-                    password.encode('utf-8'),
-                    user['password'].encode('utf-8')
-                )
+                pwd_match = bcrypt.checkpw(password.encode('utf-8'), user['password'].encode('utf-8'))
             except Exception:
                 pwd_match = False
             if not pwd_match:
                 return jsonify({"message": "Invalid email or password"}), 400
-
-            return jsonify({
-                "message": "Login successful",
-                "email": user['email'],
-                "username": user['name'],
-            }), 200
-
+            return jsonify({"message": "Login successful", "email": user['email'], "username": user['name']}), 200
         except Exception as e:
             return jsonify({"message": "Error during login", "error": str(e)}), 500
         finally:
-            cur.close()
-            conn.close()
-
-    # -------------- User Account Routes --------------
+            cur.close(); conn.close()
 
     @app.route('/user-details/<email>', methods=['GET'])
     def get_user_details(email):
@@ -150,42 +112,26 @@ def create_app():
             user = cur.fetchone()
             if not user:
                 return jsonify({"message": "User not found"}), 404
-
             prefs = user.get('preferences', {})
-
-            # Get portfolio
-            cur.execute(
-                "SELECT symbol, quantity, avg_cost FROM portfolio_holdings WHERE user_id = %s",
-                (str(user['id']),)
-            )
+            cur.execute("SELECT symbol, quantity, avg_cost FROM portfolio_holdings WHERE user_id = %s", (str(user['id']),))
             portfolio = cur.fetchall()
-
             return jsonify({
-                "userId":   str(user['id']),
-                "email":    user['email'],
-                "username": user['name'],
-                "gender":   prefs.get('gender'),
-                "age":      prefs.get('age'),
-                "investmentGoal": prefs.get('investmentGoal'),
-                "riskAppetite":   prefs.get('riskAppetite'),
-                "timeHorizon":    prefs.get('timeHorizon'),
-                "portfolio": [dict(p) for p in portfolio]
+                "userId": str(user['id']), "email": user['email'], "username": user['name'],
+                "gender": prefs.get('gender'), "age": prefs.get('age'),
+                "investmentGoal": prefs.get('investmentGoal'), "riskAppetite": prefs.get('riskAppetite'),
+                "timeHorizon": prefs.get('timeHorizon'), "portfolio": [dict(p) for p in portfolio]
             }), 200
-
         except Exception as e:
             return jsonify({"message": "Error retrieving user details", "error": str(e)}), 500
         finally:
-            cur.close()
-            conn.close()
+            cur.close(); conn.close()
 
     @app.route('/user/<email>/portfolio', methods=['POST'])
     def add_stock_to_portfolio(email):
         data = request.get_json()
         new_stock = data.get('stock')
-
         if not new_stock:
             return jsonify({"message": "No stock data provided"}), 400
-
         conn = get_connection()
         cur = get_cursor(conn)
         try:
@@ -193,34 +139,22 @@ def create_app():
             user = cur.fetchone()
             if not user:
                 return jsonify({"message": "User not found"}), 404
-
-            # Upsert portfolio holding
             cur.execute("""
                 INSERT INTO portfolio_holdings (user_id, symbol, quantity, avg_cost)
                 VALUES (%s, %s, %s, %s)
                 ON CONFLICT (user_id, symbol)
-                DO UPDATE SET
-                    quantity = EXCLUDED.quantity,
-                    avg_cost = EXCLUDED.avg_cost,
-                    updated_at = NOW()
-            """, (
-                str(user['id']),
-                new_stock.get('symbol'),
-                new_stock.get('quantity', 0),
-                new_stock.get('avg_cost', 0)
-            ))
+                DO UPDATE SET quantity = EXCLUDED.quantity, avg_cost = EXCLUDED.avg_cost, updated_at = NOW()
+            """, (str(user['id']), new_stock.get('symbol'), new_stock.get('quantity', 0), new_stock.get('avg_cost', 0)))
             conn.commit()
             return jsonify({"message": "Stock added to portfolio successfully"}), 200
-
         except Exception as e:
             conn.rollback()
             return jsonify({"message": "Error updating portfolio", "error": str(e)}), 500
         finally:
-            cur.close()
-            conn.close()
+            cur.close(); conn.close()
 
-    @app.route('/delete-portfolio/<email>', methods=['DELETE'])
-    def delete_portfolio(email):
+    @app.route('/portfolio/<email>/<symbol>', methods=['DELETE'])
+    def delete_holding(email, symbol):
         conn = get_connection()
         cur = get_cursor(conn)
         try:
@@ -228,343 +162,26 @@ def create_app():
             user = cur.fetchone()
             if not user:
                 return jsonify({"message": "User not found"}), 404
-
-            cur.execute(
-                "DELETE FROM portfolio_holdings WHERE user_id = %s",
-                (str(user['id']),)
-            )
+            conn.cursor().execute("DELETE FROM portfolio_holdings WHERE user_id = %s AND symbol = %s", (str(user['id']), symbol.upper()))
             conn.commit()
-            return jsonify({"message": "User portfolio deleted successfully"}), 200
-
-        except Exception as e:
-            conn.rollback()
-            return jsonify({"message": "Error deleting portfolio", "error": str(e)}), 500
-        finally:
-            cur.close()
-            conn.close()
-
-
-    @app.route('/portfolio/<email>/<symbol>', methods=['DELETE'])
-    def delete_holding(email, symbol):
-        """Delete a single stock from portfolio."""
-        conn = get_connection()
-        cur  = get_cursor(conn)
-        try:
-            cur.execute("SELECT id FROM users WHERE email = %s", (email,))
-            user = cur.fetchone()
-            if not user:
-                return jsonify({"message": "User not found"}), 404
-            cur2 = conn.cursor()
-            cur2.execute(
-                "DELETE FROM portfolio_holdings WHERE user_id = %s AND symbol = %s",
-                (str(user['id']), symbol.upper())
-            )
-            conn.commit()
-            cur2.close()
             return jsonify({"message": f"{symbol} removed from portfolio"}), 200
         except Exception as e:
             conn.rollback()
             return jsonify({"message": "Error removing stock", "error": str(e)}), 500
         finally:
-            cur.close()
-            conn.close()
-
-    # -------------- Stock Routes --------------
-
-    @cache.cached()
-    @app.route('/stocks/quote', methods=['GET'])
-    def get_stock_quote():
-        symbol = request.args.get('symbol')
-        if not symbol:
-            return jsonify({'error': 'Please provide the stock symbol.'}), 400
-
-        url = 'https://www.alphavantage.co/query'
-        params = {'function': 'GLOBAL_QUOTE', 'symbol': symbol.upper(), 'apikey': API_KEY}
-        response = requests.get(url, params=params)
-        if response.status_code != 200:
-            return jsonify({'error': 'Failed to fetch data from Alpha Vantage API.'}), 500
-
-        data = response.json()
-        if 'Error Message' in data or 'Note' in data:
-            return jsonify({'error': data.get('Error Message') or data.get('Note')}), 400
-        return jsonify(data)
-
-    @cache.cached()
-    @app.route('/stocks/overview', methods=['GET'])
-    def get_stock_overview():
-        symbol = request.args.get('symbol')
-        if not symbol:
-            return jsonify({'error': 'Please provide the stock symbol.'}), 400
-
-        url = 'https://www.alphavantage.co/query'
-        params = {'function': 'OVERVIEW', 'symbol': symbol.upper(), 'apikey': API_KEY}
-        response = requests.get(url, params=params)
-        if response.status_code != 200:
-            return jsonify({'error': 'Failed to fetch data from Alpha Vantage API.'}), 500
-
-        data = response.json()
-        if 'Error Message' in data or 'Note' in data:
-            return jsonify({'error': data.get('Error Message') or data.get('Note')}), 400
-        return jsonify(data)
-
-    @cache.cached()
-    @app.route('/stocks/income_statement', methods=['GET'])
-    def get_income_statement():
-        symbol = request.args.get('symbol')
-        if not symbol:
-            return jsonify({'error': 'Please provide the stock symbol.'}), 400
-
-        url = 'https://www.alphavantage.co/query'
-        params = {'function': 'INCOME_STATEMENT', 'symbol': symbol.upper(), 'apikey': API_KEY}
-        response = requests.get(url, params=params)
-        if response.status_code != 200:
-            return jsonify({'error': 'Failed to fetch data from Alpha Vantage API.'}), 500
-
-        data = response.json()
-        if 'Error Message' in data or 'Note' in data:
-            return jsonify({'error': data.get('Error Message') or data.get('Note')}), 400
-        return jsonify(data)
-
-    @cache.cached()
-    @app.route('/stocks/news', methods=['GET'])
-    def get_stock_news():
-        symbol = request.args.get('symbol')
-        if not symbol:
-            return jsonify({'error': 'Please provide the stock symbol.'}), 400
-
-        url = 'https://www.alphavantage.co/query'
-        params = {'function': 'NEWS_SENTIMENT', 'tickers': symbol.upper(), 'apikey': API_KEY}
-        response = requests.get(url, params=params)
-        if response.status_code != 200:
-            return jsonify({'error': 'Failed to fetch data from Alpha Vantage API.'}), 500
-
-        data = response.json()
-        if 'Error Message' in data or 'Note' in data:
-            return jsonify({'error': data.get('Error Message') or data.get('Note')}), 400
-        return jsonify(data)
-
-    @cache.cached()
-    @app.route('/stocks/insider_transactions', methods=['GET'])
-    def get_insider_transactions():
-        symbol = request.args.get('symbol')
-        if not symbol:
-            return jsonify({'error': 'Please provide the stock symbol.'}), 400
-
-        url = 'https://www.alphavantage.co/query'
-        params = {'function': 'INSIDER_TRANSACTIONS', 'symbol': symbol.upper(), 'apikey': API_KEY}
-        response = requests.get(url, params=params)
-        if response.status_code != 200:
-            return jsonify({'error': 'Failed to fetch data from Alpha Vantage API.'}), 500
-
-        data = response.json()
-        if 'Error Message' in data or 'Note' in data:
-            return jsonify({'error': data.get('Error Message') or data.get('Note')}), 400
-        return jsonify(data)
-
-    @app.route('/stocks/time_series_monthly', methods=['GET'])
-    @cache.cached(timeout=300, query_string=True)
-    def get_stock_time_series_monthly():
-        symbol = request.args.get('symbol')
-        if not symbol:
-            return jsonify({'error': 'Please provide the stock symbol.'}), 400
-
-        url = 'https://www.alphavantage.co/query'
-        params = {'function': 'TIME_SERIES_MONTHLY_ADJUSTED', 'symbol': symbol.upper(), 'apikey': API_KEY}
-        response = requests.get(url, params=params)
-        if response.status_code != 200:
-            return jsonify({'error': 'Failed to fetch data from Alpha Vantage API.'}), 500
-
-        data = response.json()
-        time_series_key = 'Monthly Adjusted Time Series'
-        if time_series_key not in data:
-            return jsonify({'error': 'No data found for the requested time series.'}), 400
-
-        processed_data = [
-            {
-                'time': date,
-                'open': float(values['1. open']),
-                'high': float(values['2. high']),
-                'low': float(values['3. low']),
-                'close': float(values['4. close']),
-                'adjusted_close': float(values['5. adjusted close']),
-                'volume': int(values['6. volume']),
-                'dividend_amount': float(values['7. dividend amount']),
-            }
-            for date, values in data[time_series_key].items()
-        ]
-        processed_data.sort(key=lambda x: x['time'])
-        return jsonify({'symbol': symbol, 'data': processed_data})
-
-    @app.route('/stocks/time_series', methods=['GET'])
-    @cache.cached()
-    def get_stock_time_series():
-        symbol = request.args.get('symbol')
-        time_series_function = request.args.get('function', 'TIME_SERIES_DAILY')
-
-        if not symbol:
-            return jsonify({'error': 'Please provide the stock symbol.'}), 400
-        if time_series_function not in ['TIME_SERIES_DAILY', 'TIME_SERIES_WEEKLY', 'TIME_SERIES_MONTHLY']:
-            return jsonify({'error': f'Invalid time series function: {time_series_function}'}), 400
-
-        url = 'https://www.alphavantage.co/query'
-        params = {'function': time_series_function, 'symbol': symbol.upper(), 'apikey': API_KEY}
-        response = requests.get(url, params=params)
-        if response.status_code != 200:
-            return jsonify({'error': 'Failed to fetch data from Alpha Vantage API.'}), 500
-
-        data = response.json()
-        time_series_key = {
-            'TIME_SERIES_DAILY': 'Time Series (Daily)',
-            'TIME_SERIES_WEEKLY': 'Weekly Time Series',
-            'TIME_SERIES_MONTHLY': 'Monthly Time Series'
-        }.get(time_series_function)
-
-        if time_series_key not in data:
-            return jsonify({'error': 'No data found for the requested time series.'}), 400
-
-        processed_data = [
-            {
-                'time': date,
-                'open': float(values['1. open']),
-                'high': float(values['2. high']),
-                'low': float(values['3. low']),
-                'close': float(values['4. close']),
-                'volume': int(values['5. volume']),
-            }
-            for date, values in data[time_series_key].items()
-        ]
-        processed_data.sort(key=lambda x: x['time'])
-        return jsonify({'symbol': symbol, 'data': processed_data})
-
-    @cache.cached()
-    @app.route('/stocks/daily', methods=['GET'])
-    def get_stock_daily():
-        symbol = request.args.get('symbol')
-        outputsize = request.args.get('outputsize', 'compact')
-        datatype = request.args.get('datatype', 'json')
-
-        if not symbol:
-            return jsonify({'error': 'Please provide the stock symbol.'}), 400
-
-        url = 'https://www.alphavantage.co/query'
-        params = {
-            'function': 'TIME_SERIES_DAILY',
-            'symbol': symbol.upper(),
-            'outputsize': outputsize,
-            'datatype': datatype,
-            'apikey': API_KEY
-        }
-        response = requests.get(url, params=params)
-        if response.status_code != 200:
-            return jsonify({'error': 'Failed to fetch data from Alpha Vantage API.'}), 500
-
-        data = response.json()
-        if 'Error Message' in data or 'Note' in data:
-            return jsonify({'error': data.get('Error Message') or data.get('Note')}), 400
-        return jsonify(data)
-
-    # -------------- Top Stocks Routes --------------
-
-    @cache.cached()
-    @app.route('/stocks/top_movers', methods=['GET'])
-    def get_top_movers():
-        url = 'https://www.alphavantage.co/query'
-        params = {'function': 'TOP_GAINERS_LOSERS', 'apikey': API_KEY}
-        response = requests.get(url, params=params)
-        if response.status_code != 200:
-            return jsonify({'error': 'Failed to fetch data from Alpha Vantage API.'}), 500
-
-        data = response.json()
-        if 'top_gainers' in data and 'top_losers' in data and 'most_actively_traded' in data:
-            combined_data = {
-                'top_gainers': data['top_gainers'][:10],
-                'top_losers': data['top_losers'][:10],
-                'most_active': data['most_actively_traded'][:10]
-            }
-
-            # Cache top movers in PostgreSQL price_cache
-            conn = get_connection()
-            cur = conn.cursor()
-            try:
-                cur.execute("""
-                    INSERT INTO price_cache (symbol, ohlcv, fetched_at)
-                    VALUES ('TOP_MOVERS', %s, NOW())
-                    ON CONFLICT (symbol) DO UPDATE
-                    SET ohlcv = EXCLUDED.ohlcv, fetched_at = NOW()
-                """, (json.dumps(combined_data),))
-                conn.commit()
-            except Exception as e:
-                app.logger.error('Error caching top movers: %s', str(e))
-            finally:
-                cur.close()
-                conn.close()
-
-            return jsonify(combined_data)
-        else:
-            return jsonify({'error': 'No data found for top movers.'}), 400
+            cur.close(); conn.close()
 
     @app.after_request
     def after_request(response):
         response.headers.add('Access-Control-Allow-Origin', '*')
         response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
         response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS,DELETE')
-        # Security headers
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['X-Frame-Options'] = 'DENY'
         response.headers['Cache-Control'] = 'no-store'
         return response
 
-    # -------------- ML Processing Routes --------------
-
-    @app.route('/api/rank-news', methods=['POST'])
-    def rank_news():
-        data = request.get_json()
-        news_articles = data.get('newsArticles', [])
-        if not news_articles:
-            return jsonify({'error': 'No news articles provided.'}), 400
-
-        ranked_articles = rank_news_by_impact(news_articles)
-        return jsonify(ranked_articles), 200
-
-    def rank_news_by_impact(news_articles):
-        SENTIMENT_WEIGHT = 0.5
-        RECENCY_WEIGHT = 0.3
-        SOURCE_WEIGHT = 0.2
-        current_time = datetime.datetime.utcnow()
-        source_credibility = {
-            'Reuters': 1.0, 'Bloomberg': 0.9,
-            'Wall Street Journal': 0.9, 'CNBC': 0.8,
-            'Yahoo Finance': 0.7, 'Motley Fool': 0.6,
-            'Seeking Alpha': 0.6, 'Benzinga': 0.5,
-        }
-        ranked_articles = []
-        for idx, article in enumerate(news_articles):
-            try:
-                sentiment_score = abs(float(article.get('overall_sentiment_score', 0)))
-                time_published = article.get('time_published')
-                try:
-                    article_time = datetime.datetime.strptime(time_published, '%Y%m%dT%H%M%S')
-                    time_diff = (current_time - article_time).total_seconds() / 3600
-                    recency_score = 1 / (1 + time_diff)
-                except ValueError:
-                    recency_score = 0
-
-                source = article.get('source', '').strip()
-                credibility_score = source_credibility.get(source, 0.5)
-                impact_score = (SENTIMENT_WEIGHT * sentiment_score +
-                                RECENCY_WEIGHT * recency_score +
-                                SOURCE_WEIGHT * credibility_score)
-                ranked_article = article.copy()
-                ranked_article['impact_score'] = impact_score
-                ranked_articles.append(ranked_article)
-            except Exception as e:
-                app.logger.error(f"Error processing article {idx}: {e}")
-                continue
-
-        return sorted(ranked_articles, key=lambda x: x.get('impact_score', 0), reverse=True)
-
-
-    # -------------- yfinance Routes (unlimited, no API key) --------------
+    # -------------- yfinance Stock Routes --------------
 
     @app.route('/stocks/yf/quote', methods=['GET'])
     def get_yf_quote():
@@ -572,17 +189,36 @@ def create_app():
         if not symbol:
             return jsonify({'error': 'Please provide symbol'}), 400
         try:
+            POLYGON_KEY = os.environ.get('tpDbjhdzMZ0_GCtBLTTSpIjakWVQ_w34', '')
+            if POLYGON_KEY:
+                # Use Polygon for live quote
+                url = f"https://api.polygon.io/v2/last/trade/{symbol.upper()}?apiKey={POLYGON_KEY}"
+                prev_url = f"https://api.polygon.io/v2/aggs/ticker/{symbol.upper()}/prev?apiKey={POLYGON_KEY}"
+                r1 = requests.get(url, timeout=10).json()
+                r2 = requests.get(prev_url, timeout=10).json()
+                price = r1.get('results', {}).get('p', 0)
+                prev = r2.get('results', [{}])[0].get('c', price) if r2.get('results') else price
+                chg = round(((price - prev) / prev * 100), 2) if prev else 0
+                return jsonify({
+                    'symbol': symbol.upper(),
+                    'price': round(float(price), 2),
+                    'prev_close': round(float(prev), 2),
+                    'change_pct': chg,
+                    'volume': r2.get('results', [{}])[0].get('v', 0) if r2.get('results') else 0,
+                    'high': r2.get('results', [{}])[0].get('h', 0) if r2.get('results') else 0,
+                    'low': r2.get('results', [{}])[0].get('l', 0) if r2.get('results') else 0,
+                })
+            # Fallback to yfinance
             import yfinance as yf
-            ticker = yf.Ticker(symbol.upper())
-            info = ticker.fast_info
+            info = yf.Ticker(symbol.upper()).fast_info
             return jsonify({
-                'symbol':     symbol.upper(),
-                'price':      round(float(info.last_price or 0), 2),
+                'symbol': symbol.upper(),
+                'price': round(float(info.last_price or 0), 2),
                 'prev_close': round(float(info.previous_close or 0), 2),
                 'change_pct': round(((info.last_price - info.previous_close) / info.previous_close * 100), 2) if info.previous_close else 0,
-                'volume':     int(info.three_month_average_volume or 0),
-                'high':       round(float(info.day_high or 0), 2),
-                'low':        round(float(info.day_low or 0), 2),
+                'volume': int(info.three_month_average_volume or 0),
+                'high': round(float(info.day_high or 0), 2),
+                'low': round(float(info.day_low or 0), 2),
             })
         except Exception as e:
             return jsonify({'error': str(e)}), 500
@@ -595,21 +231,43 @@ def create_app():
         if not symbol:
             return jsonify({'error': 'Please provide symbol'}), 400
         try:
+            POLYGON_KEY = os.environ.get('POLYGON_API_KEY', '')
+            if POLYGON_KEY:
+                # Convert period to date range
+                from datetime import date, timedelta
+                period_days = {
+                    '5d': 5, '1mo': 30, '3mo': 90,
+                    '6mo': 180, '1y': 365, '2y': 730
+                }
+                days = period_days.get(period, 90)
+                end   = date.today()
+                start = end - timedelta(days=days)
+                # Map interval
+                timespan = 'day' if interval == '1d' else 'week' if interval == '1wk' else 'hour'
+                url = (f"https://api.polygon.io/v2/aggs/ticker/{symbol.upper()}/range/1/{timespan}/"
+                       f"{start}/{end}?adjusted=true&sort=asc&limit=500&apiKey={POLYGON_KEY}")
+                r = requests.get(url, timeout=15).json()
+                results = r.get('results', [])
+                if not results:
+                    return jsonify({'error': 'No data found'}), 404
+                data = [{
+                    'time':   datetime.datetime.fromtimestamp(d['t']/1000).strftime('%Y-%m-%d'),
+                    'open':   round(d.get('o', 0), 2),
+                    'high':   round(d.get('h', 0), 2),
+                    'low':    round(d.get('l', 0), 2),
+                    'close':  round(d.get('c', 0), 2),
+                    'volume': int(d.get('v', 0)),
+                } for d in results]
+                return jsonify({'symbol': symbol.upper(), 'data': data})
+            # Fallback to yfinance
             import yfinance as yf
-            ticker = yf.Ticker(symbol.upper())
-            hist = ticker.history(period=period, interval=interval)
+            hist = yf.Ticker(symbol.upper()).history(period=period, interval=interval)
             if hist.empty:
                 return jsonify({'error': 'No data found'}), 404
-            data = []
-            for date, row in hist.iterrows():
-                data.append({
-                    'time':   str(date)[:10],
-                    'open':   round(float(row['Open']), 2),
-                    'high':   round(float(row['High']), 2),
-                    'low':    round(float(row['Low']), 2),
-                    'close':  round(float(row['Close']), 2),
-                    'volume': int(row['Volume']),
-                })
+            data = [{'time': str(date)[:10], 'open': round(float(row['Open']), 2),
+                     'high': round(float(row['High']), 2), 'low': round(float(row['Low']), 2),
+                     'close': round(float(row['Close']), 2), 'volume': int(row['Volume'])}
+                    for date, row in hist.iterrows()]
             return jsonify({'symbol': symbol.upper(), 'data': data})
         except Exception as e:
             return jsonify({'error': str(e)}), 500
@@ -620,14 +278,31 @@ def create_app():
         if not symbols:
             return jsonify({'error': 'Please provide symbols'}), 400
         try:
+            POLYGON_KEY = os.environ.get('POLYGON_API_KEY', '')
+            sym_list = symbols.upper().split()
+            result = {}
+            if POLYGON_KEY:
+                # Fetch previous day close for each symbol
+                for sym in sym_list:
+                    try:
+                        url = f"https://api.polygon.io/v2/aggs/ticker/{sym}/prev?apiKey={POLYGON_KEY}"
+                        r = requests.get(url, timeout=10).json()
+                        res = r.get('results', [{}])[0] if r.get('results') else {}
+                        price = res.get('c', 0)
+                        prev  = res.get('o', price)
+                        chg   = round(((price - prev) / prev * 100), 2) if prev else 0
+                        result[sym] = {'price': round(float(price), 2), 'prev_close': round(float(prev), 2), 'change_pct': chg}
+                    except:
+                        result[sym] = {'price': 0, 'prev_close': 0, 'change_pct': 0}
+                return jsonify(result)
+            # Fallback to yfinance
             import yfinance as yf
             tickers = yf.Tickers(symbols.upper())
-            result = {}
-            for sym in symbols.upper().split():
+            for sym in sym_list:
                 try:
                     info = tickers.tickers[sym].fast_info
                     result[sym] = {
-                        'price':      round(float(info.last_price or 0), 2),
+                        'price': round(float(info.last_price or 0), 2),
                         'prev_close': round(float(info.previous_close or 0), 2),
                         'change_pct': round(((info.last_price - info.previous_close) / info.previous_close * 100), 2) if info.previous_close else 0,
                     }
@@ -637,174 +312,98 @@ def create_app():
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
+    # -------------- News Routes (NewsAPI) --------------
 
-    # -------------- Market News Routes --------------
+    COMPANY_NAMES = {
+        'AAPL':'Apple','NVDA':'NVIDIA','MSFT':'Microsoft','GOOGL':'Alphabet Google',
+        'META':'Meta Platforms','AMZN':'Amazon','TSLA':'Tesla','AMD':'AMD',
+        'INTC':'Intel','JPM':'JPMorgan','BAC':'Bank of America','V':'Visa',
+        'MA':'Mastercard','NFLX':'Netflix','DIS':'Disney','COIN':'Coinbase',
+        'PYPL':'PayPal','UBER':'Uber','SHOP':'Shopify','PLTR':'Palantir',
+        'SPY':'S&P 500','QQQ':'Nasdaq','GLD':'Gold',
+    }
 
     @app.route('/stocks/news/market', methods=['GET'])
     def get_market_news():
-        """Get broad market news across top tickers using yfinance."""
         try:
-            import yfinance as yf
-            all_news = []
-            seen = set()
-            for sym in ["AAPL","NVDA","MSFT","GOOGL","META","TSLA","AMZN","SPY","JPM","NFLX"]:
-                try:
-                    ticker = yf.Ticker(sym)
-                    try:
-                        news_items = ticker.get_news(count=3)
-                    except:
-                        news_items = []
-                    if not news_items:
-                        try:
-                            news_items = ticker.news or []
-                        except:
-                            news_items = []
-                    for item in (news_items or [])[:3]:
-                        if not item or not isinstance(item, dict): continue
-                        content = item.get("content", {}) or {}
-                        if content and isinstance(content, dict):
-                            title  = content.get("title", "") or ""
-                            source = (content.get("provider") or {}).get("displayName", "") or ""
-                            url    = (content.get("canonicalUrl") or {}).get("url", "#") or "#"
-                            thumb  = (content.get("thumbnail") or {}).get("originalUrl", "") or ""
-                            pub    = content.get("pubDate", "") or ""
-                        else:
-                            title  = item.get("title", "") or ""
-                            source = item.get("publisher", "") or ""
-                            url    = item.get("link", "#") or "#"
-                            thumb  = ""
-                            pub    = str(item.get("providerPublishTime", "") or "")
-                        if title and title not in seen:
-                            seen.add(title)
-                            all_news.append({
-                                "title":     title,
-                                "source":    source,
-                                "url":       url,
-                                "published": pub,
-                                "symbol":    sym,
-                                "thumbnail": thumb,
-                            })
-                except Exception as e:
-                    app.logger.error(f"News fetch error for {sym}: {e}")
-                    continue
-            return jsonify({"articles": all_news[:30]})
+            if NEWS_API_KEY:
+                url = f"https://newsapi.org/v2/everything?q=stock+market+wall+street&sortBy=publishedAt&pageSize=15&apiKey={NEWS_API_KEY}&language=en"
+                data = requests.get(url, timeout=10).json()
+                articles = [{'title': a.get('title',''), 'url': a.get('url',''),
+                             'source': a.get('source',{}).get('name',''),
+                             'thumbnail': a.get('urlToImage',''),
+                             'published': a.get('publishedAt',''), 'symbol': 'MARKET'}
+                            for a in data.get('articles',[])
+                            if a.get('title') and '[Removed]' not in a.get('title','')]
+                return jsonify({'articles': articles})
+            return jsonify({'articles': []})
         except Exception as e:
-            return jsonify({"error": str(e), "articles": []}), 500
+            return jsonify({'articles': [], 'error': str(e)}), 200
 
     @app.route('/stocks/news/ticker', methods=['GET'])
     def get_ticker_headlines():
-        """Get short headlines for the scrolling ticker tape."""
         try:
-            import yfinance as yf
+            symbols = ['AAPL','NVDA','MSFT','GOOGL','TSLA','META','AMZN','SPY','JPM','NFLX']
             headlines = []
-            for sym in ["AAPL","NVDA","MSFT","GOOGL","TSLA","META","AMZN","SPY","JPM","NFLX"]:
-                try:
-                    ticker = yf.Ticker(sym)
-                    try:
-                        news = ticker.get_news(count=1)
-                    except:
-                        news = ticker.news or []
-                    if news:
-                        item    = news[0]
-                        content = item.get("content", {})
-                        title   = content.get("title","") if content else item.get("title","")
-                        url     = content.get("canonicalUrl",{}).get("url","#") if content else item.get("link","#")
-                        if title:
-                            headlines.append({
-                                "symbol": sym,
-                                "title":  title[:90],
-                                "url":    url,
-                            })
-                except:
-                    continue
-            return jsonify({"headlines": headlines})
+            if NEWS_API_KEY:
+                url = f"https://newsapi.org/v2/everything?q=stocks+market&sortBy=publishedAt&pageSize=20&apiKey={NEWS_API_KEY}&language=en"
+                data = requests.get(url, timeout=10).json()
+                for i, a in enumerate(data.get('articles', [])[:20]):
+                    if a.get('title') and '[Removed]' not in a.get('title',''):
+                        headlines.append({'symbol': symbols[i % len(symbols)],
+                                         'title': a.get('title','')[:100], 'url': a.get('url','#')})
+            return jsonify({'headlines': headlines})
         except Exception as e:
-            return jsonify({"error": str(e), "headlines": []}), 500
-
+            return jsonify({'headlines': []}), 200
 
     @app.route('/stocks/yf/news', methods=['GET'])
     def get_yf_news():
-        """Get stock-specific news using yfinance — no rate limits."""
         symbol = request.args.get('symbol')
         if not symbol:
             return jsonify({'error': 'Please provide symbol'}), 400
         try:
-            import yfinance as yf
-            ticker = yf.Ticker(symbol.upper())
-            try:
-                news_items = ticker.get_news(count=10)
-            except:
-                news_items = ticker.news or []
-            articles = []
-            for item in (news_items or [])[:10]:
-                if not item or not isinstance(item, dict): continue
-                try:
-                    content_data = item.get("content") or {}
-                    if content_data and isinstance(content_data, dict):
-                        title  = content_data.get("title", "") or ""
-                        source = (content_data.get("provider") or {}).get("displayName", "") or ""
-                        url    = (content_data.get("canonicalUrl") or {}).get("url", "#") or "#"
-                        thumb  = (content_data.get("thumbnail") or {}).get("originalUrl", "") or ""
-                        pub    = content_data.get("pubDate", "") or ""
-                    else:
-                        title  = item.get("title", "") or ""
-                        source = item.get("publisher", "") or ""
-                        url    = item.get("link", "#") or "#"
-                        thumb  = ""
-                        pub    = str(item.get("providerPublishTime", "") or "")
-                    if title:
-                        articles.append({
-                            "title":     title,
-                            "source":    source,
-                            "url":       url,
-                            "published": pub,
-                            "symbol":    symbol.upper(),
-                            "thumbnail": thumb,
-                            "overall_sentiment_label": "Neutral",
-                            "overall_sentiment_score": "0",
-                        })
-                except Exception:
-                    continue
-            return jsonify({"articles": articles})
+            if NEWS_API_KEY:
+                query = COMPANY_NAMES.get(symbol.upper(), symbol)
+                url = f"https://newsapi.org/v2/everything?q={query}+stock&sortBy=publishedAt&pageSize=8&apiKey={NEWS_API_KEY}&language=en"
+                data = requests.get(url, timeout=10).json()
+                articles = [{'title': a.get('title',''), 'url': a.get('url',''),
+                             'source': a.get('source',{}).get('name',''),
+                             'thumbnail': a.get('urlToImage',''),
+                             'published': a.get('publishedAt',''),
+                             'symbol': symbol.upper(),
+                             'overall_sentiment_label': 'Neutral',
+                             'overall_sentiment_score': '0'}
+                            for a in data.get('articles',[])
+                            if a.get('title') and '[Removed]' not in a.get('title','')]
+                return jsonify({'articles': articles})
+            return jsonify({'articles': []})
         except Exception as e:
-            return jsonify({"error": str(e), "articles": []}), 500
+            return jsonify({'articles': [], 'error': str(e)}), 200
 
-    # -------------- Agentic Chat Routes --------------
+    # -------------- Chat Routes --------------
 
     @app.route('/chat', methods=['POST'])
     def chat():
-        """
-        Main chat endpoint — routes to specialist agents.
-        Body: {"user_id": "uuid", "message": "your question"}
-        """
-        data    = request.get_json()
+        data = request.get_json()
         user_id = data.get('user_id')
         message = data.get('message')
-
         if not message:
             return jsonify({"error": "message is required"}), 400
-        # Use anonymous UUID if user_id is missing or looks like an email
         import re
         uuid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
         if not user_id or not uuid_pattern.match(str(user_id)):
             user_id = "00000000-0000-0000-0000-000000000001"
-
         try:
             import traceback
             result = orchestrate(user_id, message)
-            return jsonify({
-                "response":   result["response"],
-                "agent_used": result["agent_used"],
-                "symbol":     result["symbol"],
-            }), 200
+            return jsonify({"response": result["response"], "agent_used": result["agent_used"], "symbol": result["symbol"]}), 200
         except Exception as e:
             tb = traceback.format_exc()
             app.logger.error(f"Chat error: {e}\n{tb}")
-            return jsonify({"error": str(e), "detail": tb[-500:]}), 500
+            return jsonify({"error": str(e)}), 500
 
     @app.route('/chat/history/<user_id>', methods=['GET'])
     def chat_history(user_id):
-        """Get conversation history for a user."""
         try:
             history = get_chat_history(user_id, limit=20)
             return jsonify({"history": history}), 200
@@ -813,7 +412,6 @@ def create_app():
 
     @app.route('/chat/alerts/<user_id>', methods=['GET'])
     def get_alerts(user_id):
-        """Get proactive portfolio alerts for a user."""
         try:
             alerts = alert_agent(user_id, "Check my portfolio for any alerts")
             return jsonify({"alerts": alerts}), 200
@@ -823,7 +421,6 @@ def create_app():
     return app
 
 
-# Create the Flask app
 app = create_app()
 
 if __name__ == '__main__':
