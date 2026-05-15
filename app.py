@@ -28,7 +28,7 @@ def create_app():
     logging.getLogger('peewee').setLevel(logging.ERROR)
 
     # NewsAPI key for news endpoints
-    NEWS_API_KEY = os.environ.get('9a1cef249bf346ea8a28a3151c2b52a5', '')
+    NEWS_API_KEY = os.environ.get('NEWS_API_KEY', '')
 
     @app.before_request
     def log_request_info():
@@ -48,6 +48,16 @@ def create_app():
     @app.errorhandler(404)
     def not_found(e):
         return "<h1>404 Not Found</h1>", 404
+
+    @app.route('/debug/env')
+    def debug_env():
+        """Check environment variables are loaded (safe - only shows if keys exist, not values)."""
+        return jsonify({
+            'NEWS_API_KEY':    'SET' if os.environ.get('NEWS_API_KEY') else 'MISSING',
+            'POLYGON_API_KEY': 'SET' if os.environ.get('POLYGON_API_KEY') else 'MISSING',
+            'GROQ_API_KEY':    'SET' if os.environ.get('GROQ_API_KEY') else 'MISSING',
+            'DATABASE_URL':    'SET' if os.environ.get('DATABASE_URL') else 'MISSING',
+        })
 
     @app.route('/signup', methods=['POST'])
     def signup():
@@ -189,7 +199,7 @@ def create_app():
         if not symbol:
             return jsonify({'error': 'Please provide symbol'}), 400
         try:
-            POLYGON_KEY = os.environ.get('tpDbjhdzMZ0_GCtBLTTSpIjakWVQ_w34', '')
+            POLYGON_KEY = os.environ.get('POLYGON_API_KEY', '')
             if POLYGON_KEY:
                 # Use Polygon for live quote
                 url = f"https://api.polygon.io/v2/last/trade/{symbol.upper()}?apiKey={POLYGON_KEY}"
