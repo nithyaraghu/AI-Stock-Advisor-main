@@ -1,551 +1,508 @@
-"""
-agents.py — Enhanced Agentic AI System v2
-==========================================
-- Structured BUY/SELL/HOLD responses with confidence scores
-- Smart PostgreSQL memory across sessions  
-- Email alerts for RSI/MACD/Bollinger breakouts
-"""
+from flask import Flask, request, jsonify, session
+import requests
+from flask_caching import Cache
+from flask_cors import CORS
+import logging
+import json
+import os
+import numpy as np
+import datetime
+from datetime import timedelta
+import bcrypt
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
-import os, json, requests, datetime, numpy as np, smtplib, threading
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from groq import Groq
-from db import get_connection, get_cursor
+from config import settings
+from db import get_connection, get_cursor, init_db
+from agents import orchestrate, get_chat_history, alert_agent
 
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-MODEL = "llama-3.3-70b-versatile"
-EMAIL_SENDER   = os.environ.get("ALERT_EMAIL_SENDER")
-EMAIL_PASSWORD = os.environ.get("ALERT_EMAIL_PASSWORD")
-EMAIL_RECEIVER = os.environ.get("ALERT_EMAIL_RECEIVER")
+# Module-level constants
+NEWS_API_KEY = os.environ.get('NEWS_API_KEY', '')
+POLYGON_KEY  = os.environ.get('POLYGON_API_KEY', '')
+FINNHUB_KEY  = os.environ.get('FINNHUB_API_KEY', '')
 
+def create_app():
+    app = Flask(__name__)
+    CORS(app, supports_credentials=True)
 
-# ── MEMORY ────────────────────────────────────────────────────
-
-def save_message(user_id, role, message, agent_used=None):
-    conn = get_connection(); cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO chat_history (user_id,role,message,agent_used) VALUES (%s,%s,%s,%s)",
-                    (user_id, role, message, agent_used))
-        conn.commit()
-    finally:
-        cur.close(); conn.close()
-
-
-def get_chat_history(user_id, limit=10):
-    conn = get_connection(); cur = get_cursor(conn)
-    try:
-        cur.execute("SELECT role,message,agent_used,created_at FROM chat_history WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
-                    (user_id, limit))
-        return list(reversed([dict(r) for r in cur.fetchall()]))
-    finally:
-        cur.close(); conn.close()
+    cache = Cache(app, config={'CACHE_TYPE': 'SimpleCache', 'CACHE_DEFAULT_TIMEOUT': 300})
+    # Only show warnings and errors - suppress yfinance debug spam
+    logging.basicConfig(level=logging.WARNING)
+    logging.getLogger('yfinance').setLevel(logging.ERROR)
+    logging.getLogger('urllib3').setLevel(logging.ERROR)
+    logging.getLogger('peewee').setLevel(logging.ERROR)
 
 
-def get_user_portfolio(user_id):
-    conn = get_connection(); cur = get_cursor(conn)
-    try:
-        cur.execute("SELECT symbol,quantity,avg_cost FROM portfolio_holdings WHERE user_id=%s", (user_id,))
-        return [dict(r) for r in cur.fetchall()]
-    finally:
-        cur.close(); conn.close()
+    @app.before_request
+    def log_request_info():
+        app.logger.debug('Request: %s %s', request.method, request.url)
 
+    @app.after_request
+    def log_response_info(response):
+        app.logger.debug('Response: %s', response.status)
+        return response
 
-def get_user_preferences(user_id):
-    conn = get_connection(); cur = get_cursor(conn)
-    try:
-        cur.execute("SELECT preferences,name,email FROM users WHERE id=%s", (user_id,))
-        row = cur.fetchone()
-        return {"name": row["name"], "email": row.get("email"), **(row["preferences"] or {})} if row else {}
-    finally:
-        cur.close(); conn.close()
+    init_db()
 
+    @app.route('/')
+    def home():
+        return "<h1>AI Financial Advisor Backend</h1><p>The backend is running successfully.</p>"
 
-def save_agent_memory(user_id, content, memory_type="fact"):
-    conn = get_connection(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT id FROM agent_memory WHERE user_id=%s AND content=%s", (user_id, content))
-        if not cur.fetchone():
-            cur.execute("INSERT INTO agent_memory (user_id,memory_type,content) VALUES (%s,%s,%s)",
-                        (user_id, memory_type, content))
-            conn.commit()
-    finally:
-        cur.close(); conn.close()
+    @app.errorhandler(404)
+    def not_found(e):
+        return "<h1>404 Not Found</h1>", 404
 
+    @app.route('/debug/env')
+    def debug_env():
+        return jsonify({
+            'NEWS_API_KEY':    'SET' if os.environ.get('NEWS_API_KEY') else 'MISSING',
+            'POLYGON_API_KEY': 'SET' if os.environ.get('POLYGON_API_KEY') else 'MISSING',
+            'GROQ_API_KEY':    'SET' if os.environ.get('GROQ_API_KEY') else 'MISSING',
+            'DATABASE_URL':    'SET' if os.environ.get('DATABASE_URL') else 'MISSING',
+        })
 
-def get_agent_memories(user_id, limit=8):
-    conn = get_connection(); cur = get_cursor(conn)
-    try:
-        cur.execute("SELECT content,memory_type FROM agent_memory WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
-                    (user_id, limit))
-        return [dict(r) for r in cur.fetchall()]
-    finally:
-        cur.close(); conn.close()
-
-
-def extract_and_save_preferences(user_id, message):
-    keywords = {
-        "preference": ["prefer","like","love","favorite","focus on","interested in"],
-        "avoid":      ["avoid","dont like","hate","not interested","stay away"],
-        "risk":       ["risk","aggressive","conservative","moderate","safe"],
-        "goal":       ["goal","target","want to","trying to","planning to"],
-        "watchlist":  ["watching","monitor","track","keep eye on"],
-    }
-    msg_lower = message.lower()
-    for mem_type, words in keywords.items():
-        if any(w in msg_lower for w in words):
-            save_agent_memory(user_id, message, memory_type=mem_type)
-            break
-
-
-# ── DATA & INDICATORS ─────────────────────────────────────────
-
-def fetch_stock_quote(symbol):
-    """Fetch live quote — Finnhub first, Polygon fallback, yfinance last."""
-    sym = symbol.upper()
-    finnhub_key = os.environ.get("FINNHUB_API_KEY", "")
-    if finnhub_key:
+    @app.route('/debug/polygon')
+    def debug_polygon():
+        """Test Polygon API response."""
+        if not POLYGON_KEY:
+            return jsonify({'error': 'POLYGON_API_KEY not set'})
         try:
-            r = requests.get(
-                f"https://finnhub.io/api/v1/quote?symbol={sym}&token={finnhub_key}",
-                timeout=10).json()
-            price = float(r.get("c", 0) or 0)
-            prev  = float(r.get("pc", 0) or 0)
-            if price > 0:
-                return {"symbol": sym, "price": round(price, 2),
-                        "prev_close": round(prev, 2),
-                        "change_pct": round(((price-prev)/prev*100), 2) if prev else 0,
-                        "volume": 0}
-        except Exception:
-            pass
-    if POLYGON_KEY:
-        try:
-            url = f"https://api.polygon.io/v2/aggs/ticker/{sym}/prev?apiKey={POLYGON_KEY}"
-            r   = requests.get(url, timeout=10).json()
-            res = r.get("results", [{}])[0] if r.get("results") else {}
-            price = float(res.get("c", 0) or 0)
-            prev  = float(res.get("o", price) or price)
-            if price > 0:
-                return {"symbol": sym, "price": round(price, 2),
-                        "prev_close": round(prev, 2),
-                        "change_pct": round(((price-prev)/prev*100), 2) if prev else 0,
-                        "volume": int(res.get("v", 0))}
-        except Exception:
-            pass
-    try:
-        import yfinance as yf
-        info  = yf.Ticker(sym).fast_info
-        price = float(info.last_price or 0)
-        prev  = float(info.previous_close or 0)
-        if price > 0:
-            return {"symbol": sym, "price": round(price, 2),
-                    "prev_close": round(prev, 2),
-                    "change_pct": round(((price-prev)/prev*100), 2) if prev else 0,
-                    "volume": int(info.three_month_average_volume or 0)}
-    except Exception:
-        pass
-    return {"symbol": sym, "price": 0, "prev_close": 0, "change_pct": 0}
-
-
-def fetch_price_history(symbol, period="3mo"):
-    try:
-        import yfinance as yf
-        hist = yf.Ticker(symbol.upper()).history(period=period, interval="1d")
-        if hist.empty: return []
-        return [{"date": str(d)[:10], "close": round(float(r["Close"]), 2),
-                 "high": round(float(r["High"]), 2), "low": round(float(r["Low"]), 2),
-                 "volume": int(r["Volume"])} for d, r in hist.iterrows()]
-    except:
-        return []
-
-
-COMPANY_NAMES = {
-    'AAPL':'Apple','NVDA':'NVIDIA','MSFT':'Microsoft','GOOGL':'Alphabet Google',
-    'META':'Meta Platforms','AMZN':'Amazon','TSLA':'Tesla','AMD':'AMD',
-    'INTC':'Intel','JPM':'JPMorgan','BAC':'Bank of America','V':'Visa',
-    'MA':'Mastercard','NFLX':'Netflix','DIS':'Disney','COIN':'Coinbase',
-    'PYPL':'PayPal','UBER':'Uber','SHOP':'Shopify','PLTR':'Palantir',
-}
-
-def fetch_stock_news(symbol):
-    """Fetch stock news using NewsAPI - works on cloud servers."""
-    try:
-        if NEWS_API_KEY:
-            query = COMPANY_NAMES.get(symbol.upper(), symbol)
-            url   = f"https://newsapi.org/v2/everything?q={query}+stock&sortBy=publishedAt&pageSize=5&apiKey={NEWS_API_KEY}&language=en"
-            r     = requests.get(url, timeout=10).json()
-            return [{"title": a.get("title",""), "source": a.get("source",{}).get("name",""),
-                     "sentiment": "Neutral", "score": 0.0, "url": a.get("url","#")}
-                    for a in r.get("articles",[])[:5]
-                    if a.get("title") and "[Removed]" not in a.get("title","")]
-        return []
-    except:
-        return []
-
-
-def compute_indicators(prices):
-    if len(prices) < 26: return {}
-    closes = np.array([p["close"] for p in prices])
-
-    # RSI
-    deltas = np.diff(closes)
-    gains  = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
-    ag, al = np.mean(gains[:14]), np.mean(losses[:14])
-    for i in range(14, len(gains)):
-        ag = (ag * 13 + gains[i]) / 14
-        al = (al * 13 + losses[i]) / 14
-    rsi = round(100 - (100 / (1 + ag / al)) if al else 100, 2)
-
-    # MACD
-    def ema(d, p):
-        k, e = 2 / (p + 1), d[0]; v = [e]
-        for x in d[1:]: e = x * k + e * (1 - k); v.append(e)
-        return np.array(v)
-    ema12 = ema(closes, 12); ema26 = ema(closes, 26)
-    macd_line = ema12 - ema26; signal = ema(macd_line, 9)
-    histogram = float(macd_line[-1] - signal[-1])
-
-    # Bollinger Bands
-    recent = closes[-20:]; bb_mid = np.mean(recent); bb_std = np.std(recent)
-    bb_upper = round(float(bb_mid + 2 * bb_std), 2)
-    bb_lower = round(float(bb_mid - 2 * bb_std), 2)
-    bb_mid   = round(float(bb_mid), 2)
-    price    = float(closes[-1])
-
-    signals = []
-    if rsi > 70:    signals.append("RSI overbought")
-    elif rsi < 30:  signals.append("RSI oversold")
-    if histogram > 0: signals.append("MACD bullish")
-    else:             signals.append("MACD bearish")
-    if price > bb_upper:  signals.append("Above upper Bollinger Band")
-    elif price < bb_lower: signals.append("Below lower Bollinger Band")
-
-    bullish = sum(1 for s in signals if any(w in s for w in ["oversold","bullish","Below Bollinger"]))
-    bearish = sum(1 for s in signals if any(w in s for w in ["overbought","bearish","Above Bollinger"]))
-    overall    = "BUY" if bullish > bearish else "SELL" if bearish > bullish else "HOLD"
-    confidence = min(95, 50 + max(bullish, bearish) * 15)
-
-    return {"rsi": rsi, "macd": round(float(macd_line[-1]), 4),
-            "signal_line": round(float(signal[-1]), 4), "histogram": round(histogram, 4),
-            "bb_upper": bb_upper, "bb_middle": bb_mid, "bb_lower": bb_lower,
-            "price": round(price, 2), "signals": signals, "overall": overall, "confidence": confidence}
-
-
-# ── EMAIL ─────────────────────────────────────────────────────
-
-def send_email_alert(subject, body_html, receiver=None):
-    if not EMAIL_SENDER or not EMAIL_PASSWORD:
-        print("Email not configured — add ALERT_EMAIL_SENDER and ALERT_EMAIL_PASSWORD to .env")
-        return False
-    to = receiver or EMAIL_RECEIVER
-    if not to: return False
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject; msg["From"] = EMAIL_SENDER; msg["To"] = to
-        msg.attach(MIMEText(body_html, "html"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            s.sendmail(EMAIL_SENDER, to, msg.as_string())
-        print(f"Email sent: {subject}")
-        return True
-    except Exception as e:
-        print(f"Email failed: {e}")
-        return False
-
-
-def format_alert_email(alerts, user_name="Investor"):
-    rows = ""
-    for a in alerts:
-        c = "#4CAF8A" if a["type"] == "BUY" else "#C75B6A" if a["type"] == "SELL" else "#C4922A"
-        rows += f'''<tr>
-            <td style="padding:10px;border-bottom:1px solid #1A2744;font-family:monospace;color:#D6E0F5;font-weight:bold">{a["symbol"]}</td>
-            <td style="padding:10px;border-bottom:1px solid #1A2744;color:{c};font-weight:bold">{a["type"]}</td>
-            <td style="padding:10px;border-bottom:1px solid #1A2744;color:#D6E0F5">${a["price"]}</td>
-            <td style="padding:10px;border-bottom:1px solid #1A2744;color:#6B82AA">{a["reason"]}</td>
-        </tr>'''
-    return f"""<html><body style="background:#0A0F1E;color:#D6E0F5;font-family:sans-serif;padding:30px">
-<h2 style="color:#5B8DEF;font-family:monospace">MARKET INTELLIGENCE ALERTS</h2>
-<p style="color:#6B82AA">Hi {user_name}, alerts as of {datetime.datetime.now().strftime("%b %d %H:%M")}:</p>
-<table style="width:100%;border-collapse:collapse;background:#0F1629;margin:20px 0">
-<tr style="background:#141D35">
-<th style="padding:10px;text-align:left;color:#6B82AA;font-size:11px">SYMBOL</th>
-<th style="padding:10px;text-align:left;color:#6B82AA;font-size:11px">SIGNAL</th>
-<th style="padding:10px;text-align:left;color:#6B82AA;font-size:11px">PRICE</th>
-<th style="padding:10px;text-align:left;color:#6B82AA;font-size:11px">REASON</th>
-</tr>{rows}</table>
-<p style="color:#2E3F62;font-size:11px">Not financial advice.</p>
-</body></html>"""
-
-
-# ── SPECIALIST AGENTS ─────────────────────────────────────────
-
-def technical_agent(symbol, question):
-    prices = fetch_price_history(symbol)
-    if not prices: return f"Could not fetch price data for {symbol}."
-    ind   = compute_indicators(prices)
-    quote = fetch_stock_quote(symbol)
-    emoji = {"BUY": "GREEN SIGNAL", "SELL": "RED SIGNAL", "HOLD": "NEUTRAL"}.get(ind.get("overall", "HOLD"), "NEUTRAL")
-    context = f"""Symbol: {symbol} | Price: ${ind.get("price", quote.get("price"))} | Change: {quote.get("change_pct", 0):+.2f}%
-RSI: {ind.get("rsi")} | MACD: {ind.get("macd")} | Signal: {ind.get("signal_line")} | Histogram: {ind.get("histogram")}
-BB Upper: ${ind.get("bb_upper")} | Middle: ${ind.get("bb_middle")} | Lower: ${ind.get("bb_lower")}
-Signals: {", ".join(ind.get("signals", []))}
-Overall: {ind.get("overall")} ({ind.get("confidence")}% confidence)
-Question: {question}"""
-    messages = [
-        {"role": "system", "content": f"""You are an expert technical analyst.
-Format your response EXACTLY like this:
-
-## SIGNAL: {ind.get("overall","HOLD")} ({ind.get("confidence",50)}% confidence)
-**Price:** $X | **Timeframe:** Short-term (1-2 weeks)
-
-### Indicator Summary
-- RSI ({ind.get("rsi")}): [interpretation]
-- MACD ({ind.get("macd")}): [interpretation]
-- Bollinger Bands: [position and meaning]
-
-### Key Insight
-[2-3 sentences on the most important signal]
-
-### Action
-[Clear specific recommendation]
-
-Not financial advice."""},
-        {"role": "user", "content": context}
-    ]
-    return client.chat.completions.create(model=MODEL, messages=messages, max_tokens=600).choices[0].message.content
-
-
-def research_agent(symbol, question):
-    quote  = fetch_stock_quote(symbol)
-    news   = fetch_stock_news(symbol)
-    prices = fetch_price_history(symbol, period="1mo")
-    ind    = compute_indicators(prices) if prices else {}
-    scores = [n.get("score", 0) for n in news if n.get("score")]
-    avg    = round(sum(scores) / len(scores), 3) if scores else 0
-    label  = "BULLISH" if avg > 0.15 else "BEARISH" if avg < -0.15 else "NEUTRAL"
-    headlines = chr(10).join([f"- [{n.get('sentiment','')}] {n.get('title','')}" for n in news[:4]])
-    context = f"""Symbol: {symbol} | Price: ${quote.get("price")} ({quote.get("change_pct", 0):+.2f}%)
-News sentiment: {avg} ({label}) | RSI: {ind.get("rsi","N/A")}
-Headlines:
-{headlines}
-Question: {question}"""
-    messages = [
-        {"role": "system", "content": """Format EXACTLY:
-
-## RESEARCH: {SYMBOL}
-### Market Sentiment: [BULLISH/BEARISH/NEUTRAL]
-
-### Key Developments
-[3-4 bullet points]
-
-### News Analysis
-[2-3 sentences]
-
-### Bottom Line
-[1-2 sentences clear takeaway]
-
-Not financial advice."""},
-        {"role": "user", "content": context}
-    ]
-    return client.chat.completions.create(model=MODEL, messages=messages, max_tokens=600).choices[0].message.content
-
-
-def portfolio_agent(user_id, question):
-    portfolio = get_user_portfolio(user_id)
-    prefs     = get_user_preferences(user_id)
-    memories  = get_agent_memories(user_id, limit=5)
-    if not portfolio:
-        return "No stocks in portfolio yet. Add stocks to get personalized analysis."
-    holdings_data = []; total_value = 0
-    for h in portfolio:
-        quote = fetch_stock_quote(h["symbol"])
-        price = quote.get("price", h["avg_cost"])
-        curr  = price * h["quantity"]; cost = h["avg_cost"] * h["quantity"]
-        pnl   = curr - cost; pnl_pct = (pnl / cost * 100) if cost else 0
-        total_value += curr
-        holdings_data.append({"symbol": h["symbol"], "quantity": h["quantity"], "avg_cost": h["avg_cost"],
-                               "current_price": price, "value": round(curr, 2),
-                               "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 2)})
-    for h in holdings_data:
-        h["weight"] = round(h["value"] / total_value * 100, 1) if total_value else 0
-    mem_ctx = chr(10).join([f"- [{m['memory_type']}] {m['content']}" for m in memories])
-    context = f"""User: {prefs.get("name")} | Risk: {prefs.get("riskAppetite")} | Goal: {prefs.get("investmentGoal")}
-Preferences: {mem_ctx or "None recorded"}
-Portfolio (Total: ${round(total_value, 2)}):
-{json.dumps(holdings_data, indent=2)}
-Question: {question}"""
-    messages = [
-        {"role": "system", "content": """Format EXACTLY:
-
-## PORTFOLIO ANALYSIS
-**Total Value:** $X
-
-### Top Performers
-[Top 2-3 by P&L%]
-
-### Risk Flags
-[Concentration, underperformers]
-
-### Rebalancing Actions
-1. [specific action]
-2. [specific action]
-3. [specific action]
-
-Not financial advice."""},
-        {"role": "user", "content": context}
-    ]
-    return client.chat.completions.create(model=MODEL, messages=messages, max_tokens=700).choices[0].message.content
-
-
-def sentiment_agent(symbol, question):
-    news = fetch_stock_news(symbol)
-    if not news: return f"Could not fetch news for {symbol}."
-    scores = [float(n.get("score", 0)) for n in news if n.get("score") is not None]
-    avg   = round(sum(scores) / len(scores), 3) if scores else 0
-    label = "BULLISH" if avg > 0.15 else "BEARISH" if avg < -0.15 else "NEUTRAL"
-    context = (f"Symbol: {symbol} | Score: {avg} ({label}) | Articles: {len(news)}\n"
-               + json.dumps(news, indent=2)
-               + f"\nQuestion: {question}")
-    messages = [
-        {"role": "system", "content": """Format EXACTLY:
-
-## SENTIMENT: {SYMBOL}
-**Score:** X.XXX → [BULLISH/BEARISH/NEUTRAL]
-
-### Bullish Themes
-[Key positive narratives]
-
-### Bearish Concerns
-[Key risks]
-
-### Trading Implication
-[1 sentence on short-term price impact]
-
-Not financial advice."""},
-        {"role": "user", "content": context}
-    ]
-    return client.chat.completions.create(model=MODEL, messages=messages, max_tokens=500).choices[0].message.content
-
-
-def alert_agent(user_id, question):
-    portfolio = get_user_portfolio(user_id)
-    prefs     = get_user_preferences(user_id)
-    if not portfolio:
-        return "No portfolio found. Add stocks to enable alerts."
-    alerts = []; alert_objects = []
-    for h in portfolio:
-        sym    = h["symbol"]
-        prices = fetch_price_history(sym, "1mo")
-        if not prices: continue
-        ind   = compute_indicators(prices)
-        quote = fetch_stock_quote(sym)
-        price = quote.get("price", 0)
-        rsi   = ind.get("rsi", 50); hist = ind.get("histogram", 0)
-        bb_u  = ind.get("bb_upper", 0); bb_l = ind.get("bb_lower", 0)
-        if rsi > 75:   alerts.append(f"RED {sym} RSI={rsi} - Strongly overbought. Consider taking profits."); alert_objects.append({"symbol": sym, "type": "SELL", "price": price, "reason": f"RSI={rsi} strongly overbought"})
-        elif rsi > 70: alerts.append(f"YELLOW {sym} RSI={rsi} - Overbought. Watch for reversal."); alert_objects.append({"symbol": sym, "type": "SELL", "price": price, "reason": f"RSI={rsi} overbought"})
-        elif rsi < 25: alerts.append(f"GREEN {sym} RSI={rsi} - Strongly oversold. Potential buy."); alert_objects.append({"symbol": sym, "type": "BUY", "price": price, "reason": f"RSI={rsi} strongly oversold"})
-        elif rsi < 30: alerts.append(f"GREEN {sym} RSI={rsi} - Oversold. Monitor for bounce."); alert_objects.append({"symbol": sym, "type": "BUY", "price": price, "reason": f"RSI={rsi} oversold"})
-        if hist > 0.5:   alerts.append(f"UP {sym} MACD={hist:.3f} - Strong bullish momentum."); alert_objects.append({"symbol": sym, "type": "BUY", "price": price, "reason": f"MACD {hist:.3f} bullish"})
-        elif hist < -0.5: alerts.append(f"DOWN {sym} MACD={hist:.3f} - Bearish momentum."); alert_objects.append({"symbol": sym, "type": "SELL", "price": price, "reason": f"MACD {hist:.3f} bearish"})
-        if price and bb_u and price > bb_u * 1.02: alerts.append(f"WARNING {sym} ${price} above BB upper ${bb_u}. Potential pullback.")
-        elif price and bb_l and price < bb_l * 0.98: alerts.append(f"INFO {sym} ${price} below BB lower ${bb_l}. Potential bounce.")
-    if not alerts:
-        return "All Clear - No critical alerts. All positions within normal technical ranges."
-    if alert_objects and EMAIL_SENDER:
-        user_email = prefs.get("email")
-        html = format_alert_email(alert_objects, prefs.get("name", "Investor"))
-        threading.Thread(target=send_email_alert,
-            args=(f"Market Intelligence: {len(alert_objects)} Alert(s)", html, user_email),
-            daemon=True).start()
-    messages = [
-        {"role": "system", "content": f"""Format EXACTLY:
-
-## PORTFOLIO ALERTS ({len(alerts)} found)
-
-[list alerts clearly]
-
-### Priority Actions
-1. [most urgent]
-2. [second priority]
-3. [third]
-
-{"Email alert sent to your inbox." if alert_objects and EMAIL_SENDER else ""}
-Not financial advice."""},
-        {"role": "user", "content": "Alerts:\n" + chr(10).join(alerts) + f"\nQuestion: {question}"}
-    ]
-    return client.chat.completions.create(model=MODEL, messages=messages, max_tokens=600).choices[0].message.content
-
-
-# ── PROACTIVE SCHEDULER ───────────────────────────────────────
-
-def run_proactive_alerts():
-    conn = get_connection(); cur = get_cursor(conn)
-    try:
-        cur.execute("SELECT id,email,name FROM users LIMIT 50")
-        users = cur.fetchall()
-    finally:
-        cur.close(); conn.close()
-    for user in users:
-        try:
-            portfolio = get_user_portfolio(str(user["id"]))
-            if not portfolio: continue
-            alert_objects = []
-            for h in portfolio:
-                prices = fetch_price_history(h["symbol"], "1mo")
-                if not prices: continue
-                ind   = compute_indicators(prices)
-                quote = fetch_stock_quote(h["symbol"])
-                price = quote.get("price", 0)
-                rsi   = ind.get("rsi", 50); hist = ind.get("histogram", 0)
-                if rsi > 70:     alert_objects.append({"symbol": h["symbol"], "type": "SELL", "price": price, "reason": f"RSI={rsi}"})
-                elif rsi < 30:   alert_objects.append({"symbol": h["symbol"], "type": "BUY",  "price": price, "reason": f"RSI={rsi}"})
-                if abs(hist) > 0.5:
-                    t = "BUY" if hist > 0 else "SELL"
-                    alert_objects.append({"symbol": h["symbol"], "type": t, "price": price, "reason": f"MACD {hist:.3f}"})
-            if alert_objects:
-                html = format_alert_email(alert_objects, user["name"] or "Investor")
-                send_email_alert(f"Market Intelligence: {len(alert_objects)} Alert(s)", html, user.get("email") or EMAIL_RECEIVER)
+            # Test prev aggs
+            url = f"https://api.polygon.io/v2/aggs/ticker/AAPL/prev?adjusted=true&apiKey={POLYGON_KEY}"
+            r = requests.get(url, timeout=10).json()
+            return jsonify({'prev_aggs': r})
         except Exception as e:
-            print(f"Alert scan error: {e}")
+            return jsonify({'error': str(e)})
+
+    @app.route('/signup', methods=['POST'])
+    def signup():
+        data = request.get_json()
+        username = data.get('username')
+        email = data.get('email')
+        password = data.get('password')
+        hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        conn = get_connection()
+        cur = get_cursor(conn)
+        try:
+            cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+            if cur.fetchone():
+                return jsonify({"message": "Email already exists"}), 400
+            cur.execute("""
+                INSERT INTO users (email, password, name, preferences)
+                VALUES (%s, %s, %s, %s)
+            """, (email, hashed_password, username, json.dumps({
+                "gender": data.get('gender'), "age": data.get('age'),
+                "investmentGoal": data.get('investmentGoal'),
+                "riskAppetite": data.get('riskAppetite'),
+                "timeHorizon": data.get('timeHorizon')
+            })))
+            conn.commit()
+            return jsonify({"message": "User signed up successfully"}), 201
+        except Exception as e:
+            conn.rollback()
+            return jsonify({"message": "Error creating user", "error": str(e)}), 500
+        finally:
+            cur.close(); conn.close()
+
+    @app.route('/login', methods=['POST'])
+    def login():
+        data = request.get_json()
+        email = data.get('email')
+        password = data.get('password')
+        conn = get_connection()
+        cur = get_cursor(conn)
+        try:
+            cur.execute("SELECT * FROM users WHERE email = %s", (email,))
+            user = cur.fetchone()
+            if not user:
+                return jsonify({"message": "User not found"}), 400
+            try:
+                pwd_match = bcrypt.checkpw(password.encode('utf-8'), user['password'].encode('utf-8'))
+            except Exception:
+                pwd_match = False
+            if not pwd_match:
+                return jsonify({"message": "Invalid email or password"}), 400
+            return jsonify({"message": "Login successful", "email": user['email'], "username": user['name']}), 200
+        except Exception as e:
+            return jsonify({"message": "Error during login", "error": str(e)}), 500
+        finally:
+            cur.close(); conn.close()
+
+    @app.route('/user-details/<email>', methods=['GET'])
+    def get_user_details(email):
+        conn = get_connection()
+        cur = get_cursor(conn)
+        try:
+            cur.execute("SELECT * FROM users WHERE email = %s", (email,))
+            user = cur.fetchone()
+            if not user:
+                return jsonify({"message": "User not found"}), 404
+            prefs = user.get('preferences', {})
+            cur.execute("SELECT symbol, quantity, avg_cost FROM portfolio_holdings WHERE user_id = %s", (str(user['id']),))
+            portfolio = cur.fetchall()
+            return jsonify({
+                "userId": str(user['id']), "email": user['email'], "username": user['name'],
+                "gender": prefs.get('gender'), "age": prefs.get('age'),
+                "investmentGoal": prefs.get('investmentGoal'), "riskAppetite": prefs.get('riskAppetite'),
+                "timeHorizon": prefs.get('timeHorizon'), "portfolio": [dict(p) for p in portfolio]
+            }), 200
+        except Exception as e:
+            return jsonify({"message": "Error retrieving user details", "error": str(e)}), 500
+        finally:
+            cur.close(); conn.close()
+
+    @app.route('/user/<email>/portfolio', methods=['POST'])
+    def add_stock_to_portfolio(email):
+        data = request.get_json()
+        new_stock = data.get('stock')
+        if not new_stock:
+            return jsonify({"message": "No stock data provided"}), 400
+        conn = get_connection()
+        cur = get_cursor(conn)
+        try:
+            cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+            user = cur.fetchone()
+            if not user:
+                return jsonify({"message": "User not found"}), 404
+            cur.execute("""
+                INSERT INTO portfolio_holdings (user_id, symbol, quantity, avg_cost)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (user_id, symbol)
+                DO UPDATE SET quantity = EXCLUDED.quantity, avg_cost = EXCLUDED.avg_cost, updated_at = NOW()
+            """, (str(user['id']), new_stock.get('symbol'), new_stock.get('quantity', 0), new_stock.get('avg_cost', 0)))
+            conn.commit()
+            return jsonify({"message": "Stock added to portfolio successfully"}), 200
+        except Exception as e:
+            conn.rollback()
+            return jsonify({"message": "Error updating portfolio", "error": str(e)}), 500
+        finally:
+            cur.close(); conn.close()
+
+    @app.route('/portfolio/<email>/<symbol>', methods=['DELETE'])
+    def delete_holding(email, symbol):
+        conn = get_connection()
+        cur = get_cursor(conn)
+        try:
+            cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+            user = cur.fetchone()
+            if not user:
+                return jsonify({"message": "User not found"}), 404
+            conn.cursor().execute("DELETE FROM portfolio_holdings WHERE user_id = %s AND symbol = %s", (str(user['id']), symbol.upper()))
+            conn.commit()
+            return jsonify({"message": f"{symbol} removed from portfolio"}), 200
+        except Exception as e:
+            conn.rollback()
+            return jsonify({"message": "Error removing stock", "error": str(e)}), 500
+        finally:
+            cur.close(); conn.close()
+
+    @app.after_request
+    def after_request(response):
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS,DELETE')
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+
+    # -------------- yfinance Stock Routes --------------
+
+    @app.route('/stocks/yf/quote', methods=['GET'])
+    def get_yf_quote():
+        """Get live stock quote — Finnhub first (60 req/min), Polygon fallback, yfinance last."""
+        symbol = request.args.get('symbol')
+        if not symbol:
+            return jsonify({'error': 'Please provide symbol'}), 400
+        try:
+            sym = symbol.upper()
+
+            # 1. Finnhub — 60 req/min free, no IP blocking
+            if FINNHUB_KEY:
+                try:
+                    r = requests.get(
+                        f"https://finnhub.io/api/v1/quote?symbol={sym}&token={FINNHUB_KEY}",
+                        timeout=10).json()
+                    price = float(r.get('c', 0) or 0)
+                    prev  = float(r.get('pc', 0) or 0)
+                    if price > 0:
+                        return jsonify({
+                            'symbol':     sym,
+                            'price':      round(price, 2),
+                            'prev_close': round(prev, 2),
+                            'change_pct': round(((price-prev)/prev*100), 2) if prev else 0,
+                            'high':       round(float(r.get('h', 0) or 0), 2),
+                            'low':        round(float(r.get('l', 0) or 0), 2),
+                            'volume':     0,
+                        })
+                except Exception:
+                    pass
+
+            # 2. Polygon fallback
+            if POLYGON_KEY:
+                try:
+                    from datetime import date, timedelta
+                    end   = date.today()
+                    start = end - timedelta(days=10)
+                    url   = (f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day/"
+                             f"{start}/{end}?adjusted=true&sort=desc&limit=2&apiKey={POLYGON_KEY}")
+                    r = requests.get(url, timeout=15).json()
+                    results = r.get('results', [])
+                    if results:
+                        latest = results[0]
+                        prev_r = results[1] if len(results) > 1 else results[0]
+                        price  = float(latest.get('c', 0) or 0)
+                        prev   = float(prev_r.get('c', price) or price)
+                        if price > 0:
+                            return jsonify({
+                                'symbol':     sym,
+                                'price':      round(price, 2),
+                                'prev_close': round(prev, 2),
+                                'change_pct': round(((price-prev)/prev*100), 2) if prev else 0,
+                                'high':       round(float(latest.get('h', 0)), 2),
+                                'low':        round(float(latest.get('l', 0)), 2),
+                                'volume':     int(latest.get('v', 0)),
+                            })
+                except Exception:
+                    pass
+
+            # 3. yfinance last resort
+            try:
+                import yfinance as yf
+                info  = yf.Ticker(sym).fast_info
+                price = float(info.last_price or 0)
+                prev  = float(info.previous_close or 0)
+                if price > 0:
+                    return jsonify({
+                        'symbol':     sym,
+                        'price':      round(price, 2),
+                        'prev_close': round(prev, 2),
+                        'change_pct': round(((price-prev)/prev*100), 2) if prev else 0,
+                        'high':       round(float(info.day_high or 0), 2),
+                        'low':        round(float(info.day_low or 0), 2),
+                        'volume':     int(info.three_month_average_volume or 0),
+                    })
+            except Exception:
+                pass
+
+            return jsonify({'symbol': sym, 'price': 0, 'prev_close': 0, 'change_pct': 0})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/stocks/yf/history', methods=['GET'])
+    def get_yf_history():
+        symbol   = request.args.get('symbol')
+        period   = request.args.get('period', '3mo')
+        interval = request.args.get('interval', '1d')
+        if not symbol:
+            return jsonify({'error': 'Please provide symbol'}), 400
+        try:
+            if POLYGON_KEY:
+                # Convert period to date range
+                from datetime import date, timedelta
+                period_days = {
+                    '5d': 5, '1mo': 30, '3mo': 90,
+                    '6mo': 180, '1y': 365, '2y': 730
+                }
+                days = period_days.get(period, 90)
+                end   = date.today()
+                start = end - timedelta(days=days)
+                # Map interval
+                timespan = 'day' if interval == '1d' else 'week' if interval == '1wk' else 'hour'
+                url = (f"https://api.polygon.io/v2/aggs/ticker/{symbol.upper()}/range/1/{timespan}/"
+                       f"{start}/{end}?adjusted=true&sort=asc&limit=500&apiKey={POLYGON_KEY}")
+                r = requests.get(url, timeout=15).json()
+                results = r.get('results', [])
+                if not results:
+                    return jsonify({'error': 'No data found'}), 404
+                data = [{
+                    'time':   datetime.datetime.fromtimestamp(d['t']/1000).strftime('%Y-%m-%d'),
+                    'open':   round(d.get('o', 0), 2),
+                    'high':   round(d.get('h', 0), 2),
+                    'low':    round(d.get('l', 0), 2),
+                    'close':  round(d.get('c', 0), 2),
+                    'volume': int(d.get('v', 0)),
+                } for d in results]
+                return jsonify({'symbol': symbol.upper(), 'data': data})
+            # Fallback to yfinance
+            import yfinance as yf
+            hist = yf.Ticker(symbol.upper()).history(period=period, interval=interval)
+            if hist.empty:
+                return jsonify({'error': 'No data found'}), 404
+            data = [{'time': str(date)[:10], 'open': round(float(row['Open']), 2),
+                     'high': round(float(row['High']), 2), 'low': round(float(row['Low']), 2),
+                     'close': round(float(row['Close']), 2), 'volume': int(row['Volume'])}
+                    for date, row in hist.iterrows()]
+            return jsonify({'symbol': symbol.upper(), 'data': data})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/stocks/yf/multi', methods=['GET'])
+    def get_yf_multi():
+        """Get quotes for multiple symbols using Finnhub."""
+        symbols = request.args.get('symbols', '')
+        if not symbols:
+            return jsonify({'error': 'Please provide symbols'}), 400
+        try:
+            sym_list = symbols.upper().split()
+            result   = {}
+            if FINNHUB_KEY:
+                for sym in sym_list:
+                    try:
+                        url = f"https://finnhub.io/api/v1/quote?symbol={sym}&token={FINNHUB_KEY}"
+                        r   = requests.get(url, timeout=10).json()
+                        price = r.get('c', 0)
+                        prev  = r.get('pc', 0)
+                        chg   = round(((price - prev) / prev * 100), 2) if prev else 0
+                        result[sym] = {
+                            'price':      round(float(price), 2),
+                            'prev_close': round(float(prev), 2),
+                            'change_pct': chg,
+                        }
+                    except:
+                        result[sym] = {'price': 0, 'prev_close': 0, 'change_pct': 0}
+                return jsonify(result)
+            # Fallback to Polygon
+            if POLYGON_KEY:
+                for sym in sym_list:
+                    try:
+                        url = f"https://api.polygon.io/v2/aggs/ticker/{sym}/prev?apiKey={POLYGON_KEY}"
+                        r   = requests.get(url, timeout=10).json()
+                        res = r.get('results', [{}])[0] if r.get('results') else {}
+                        price = res.get('c', 0); prev = res.get('o', price)
+                        result[sym] = {'price': round(float(price), 2), 'prev_close': round(float(prev), 2),
+                                       'change_pct': round(((price-prev)/prev*100), 2) if prev else 0}
+                    except:
+                        result[sym] = {'price': 0, 'prev_close': 0, 'change_pct': 0}
+                return jsonify(result)
+            # Fallback to yfinance
+            import yfinance as yf
+            tickers = yf.Tickers(symbols.upper())
+            for sym in sym_list:
+                try:
+                    info = tickers.tickers[sym].fast_info
+                    result[sym] = {
+                        'price':      round(float(info.last_price or 0), 2),
+                        'prev_close': round(float(info.previous_close or 0), 2),
+                        'change_pct': round(((info.last_price-info.previous_close)/info.previous_close*100), 2) if info.previous_close else 0,
+                    }
+                except:
+                    result[sym] = {'price': 0, 'prev_close': 0, 'change_pct': 0}
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    # -------------- News Routes (NewsAPI) --------------
+
+    COMPANY_NAMES = {
+        'AAPL':'Apple','NVDA':'NVIDIA','MSFT':'Microsoft','GOOGL':'Alphabet Google',
+        'META':'Meta Platforms','AMZN':'Amazon','TSLA':'Tesla','AMD':'AMD',
+        'INTC':'Intel','JPM':'JPMorgan','BAC':'Bank of America','V':'Visa',
+        'MA':'Mastercard','NFLX':'Netflix','DIS':'Disney','COIN':'Coinbase',
+        'PYPL':'PayPal','UBER':'Uber','SHOP':'Shopify','PLTR':'Palantir',
+        'SPY':'S&P 500','QQQ':'Nasdaq','GLD':'Gold',
+    }
+
+    @app.route('/stocks/news/market', methods=['GET'])
+    def get_market_news():
+        try:
+            if NEWS_API_KEY:
+                url = f"https://newsapi.org/v2/everything?q=stock+market+wall+street&sortBy=publishedAt&pageSize=15&apiKey={NEWS_API_KEY}&language=en"
+                data = requests.get(url, timeout=10).json()
+                articles = [{'title': a.get('title',''), 'url': a.get('url',''),
+                             'source': a.get('source',{}).get('name',''),
+                             'thumbnail': a.get('urlToImage',''),
+                             'published': a.get('publishedAt',''), 'symbol': 'MARKET'}
+                            for a in data.get('articles',[])
+                            if a.get('title') and '[Removed]' not in a.get('title','')]
+                return jsonify({'articles': articles})
+            return jsonify({'articles': []})
+        except Exception as e:
+            return jsonify({'articles': [], 'error': str(e)}), 200
+
+    @app.route('/stocks/news/ticker', methods=['GET'])
+    def get_ticker_headlines():
+        try:
+            symbols = ['AAPL','NVDA','MSFT','GOOGL','TSLA','META','AMZN','SPY','JPM','NFLX']
+            headlines = []
+            if NEWS_API_KEY:
+                url = f"https://newsapi.org/v2/everything?q=stocks+market&sortBy=publishedAt&pageSize=20&apiKey={NEWS_API_KEY}&language=en"
+                data = requests.get(url, timeout=10).json()
+                for i, a in enumerate(data.get('articles', [])[:20]):
+                    if a.get('title') and '[Removed]' not in a.get('title',''):
+                        headlines.append({'symbol': symbols[i % len(symbols)],
+                                         'title': a.get('title','')[:100], 'url': a.get('url','#')})
+            return jsonify({'headlines': headlines})
+        except Exception as e:
+            return jsonify({'headlines': []}), 200
+
+    @app.route('/stocks/yf/news', methods=['GET'])
+    def get_yf_news():
+        symbol = request.args.get('symbol')
+        if not symbol:
+            return jsonify({'error': 'Please provide symbol'}), 400
+        try:
+            if NEWS_API_KEY:
+                query = COMPANY_NAMES.get(symbol.upper(), symbol)
+                url = f"https://newsapi.org/v2/everything?q={query}+stock&sortBy=publishedAt&pageSize=8&apiKey={NEWS_API_KEY}&language=en"
+                data = requests.get(url, timeout=10).json()
+                articles = [{'title': a.get('title',''), 'url': a.get('url',''),
+                             'source': a.get('source',{}).get('name',''),
+                             'thumbnail': a.get('urlToImage',''),
+                             'published': a.get('publishedAt',''),
+                             'symbol': symbol.upper(),
+                             'overall_sentiment_label': 'Neutral',
+                             'overall_sentiment_score': '0'}
+                            for a in data.get('articles',[])
+                            if a.get('title') and '[Removed]' not in a.get('title','')]
+                return jsonify({'articles': articles})
+            return jsonify({'articles': []})
+        except Exception as e:
+            return jsonify({'articles': [], 'error': str(e)}), 200
+
+    # -------------- Chat Routes --------------
+
+    @app.route('/chat', methods=['POST'])
+    def chat():
+        data = request.get_json()
+        user_id = data.get('user_id')
+        message = data.get('message')
+        if not message:
+            return jsonify({"error": "message is required"}), 400
+        import re
+        uuid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+        if not user_id or not uuid_pattern.match(str(user_id)):
+            user_id = "00000000-0000-0000-0000-000000000001"
+        try:
+            import traceback
+            result = orchestrate(user_id, message)
+            return jsonify({"response": result["response"], "agent_used": result["agent_used"], "symbol": result["symbol"]}), 200
+        except Exception as e:
+            tb = traceback.format_exc()
+            app.logger.error(f"Chat error: {e}\n{tb}")
+            return jsonify({"error": str(e)}), 500
+
+    @app.route('/chat/history/<user_id>', methods=['GET'])
+    def chat_history(user_id):
+        try:
+            history = get_chat_history(user_id, limit=20)
+            return jsonify({"history": history}), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route('/chat/alerts/<user_id>', methods=['GET'])
+    def get_alerts(user_id):
+        try:
+            alerts = alert_agent(user_id, "Check my portfolio for any alerts")
+            return jsonify({"alerts": alerts}), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    return app
 
 
-# ── ORCHESTRATOR ──────────────────────────────────────────────
+app = create_app()
 
-def detect_intent(message):
-    prompt = f"""Return ONLY valid JSON. Question: "{message}"
-Fields: "agent" (technical/research/portfolio/sentiment/alert/general), "symbol" (ticker or null)
-Example: {{"agent":"technical","symbol":"AAPL"}}"""
-    resp = client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=80)
-    try:
-        text = resp.choices[0].message.content.strip()
-        return json.loads(text[text.find("{"):text.rfind("}") + 1])
-    except:
-        return {"agent": "general", "symbol": None}
-
-
-def orchestrate(user_id, message):
-    save_message(user_id, "user", message)
-    memories = get_agent_memories(user_id, 5)
-    prefs    = get_user_preferences(user_id)
-    extract_and_save_preferences(user_id, message)
-    intent = detect_intent(message)
-    agent  = intent.get("agent", "general")
-    symbol = intent.get("symbol")
-    if agent == "technical" and symbol:   response_text = technical_agent(symbol, message)
-    elif agent == "research" and symbol:  response_text = research_agent(symbol, message)
-    elif agent == "portfolio":            response_text = portfolio_agent(user_id, message)
-    elif agent == "sentiment" and symbol: response_text = sentiment_agent(symbol, message)
-    elif agent == "alert":                response_text = alert_agent(user_id, message)
-    else:
-        history  = get_chat_history(user_id, 6)
-        mem_ctx  = chr(10).join([f"- [{m['memory_type']}] {m['content']}" for m in memories])
-        system   = f"""You are Market Intelligence - a sharp AI stock advisor.
-User: {prefs.get("name","Investor")} | Risk: {prefs.get("riskAppetite","Unknown")} | Goal: {prefs.get("investmentGoal","Unknown")}
-Known preferences: {mem_ctx or "None yet - learn from this conversation."}
-Be concise, specific, actionable. End financial advice with: Not financial advice."""
-        msgs = [{"role": "system", "content": system}] +                [{"role": h["role"], "content": h["message"]} for h in history[-4:]] +                [{"role": "user", "content": message}]
-        response_text = client.chat.completions.create(model=MODEL, messages=msgs, max_tokens=500).choices[0].message.content
-        agent = "general"
-    save_message(user_id, "assistant", response_text, agent)
-    return {"response": response_text, "agent_used": agent, "symbol": symbol, "intent": intent}
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(debug=True, host='0.0.0.0', port=port)
