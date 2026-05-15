@@ -28,7 +28,7 @@ def create_app():
     logging.getLogger('peewee').setLevel(logging.ERROR)
 
     # NewsAPI key for news endpoints
-    NEWS_API_KEY = os.environ.get('NEWS_API_KEY', '')
+    NEWS_API_KEY = os.environ.get('9a1cef249bf346ea8a28a3151c2b52a5', '')
 
     @app.before_request
     def log_request_info():
