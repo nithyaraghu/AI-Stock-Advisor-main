@@ -6,10 +6,14 @@ from config import settings
 DATABASE_URL = settings['database_url']
 
 # ── Connect to PostgreSQL ──────────────────────────────────────
-def get_connection():
+def get_connection(register_vec=True):
     """Get a raw psycopg2 connection. Always close after use."""
     conn = psycopg2.connect(DATABASE_URL)
-    register_vector(conn)
+    if register_vec:
+        try:
+            register_vector(conn)
+        except Exception:
+            pass  # vector extension may not exist yet - init_db will create it
     return conn
 
 def get_cursor(conn):
@@ -23,14 +27,15 @@ def init_db():
     Replaces Cosmos DB container creation.
     Called automatically when app.py starts.
     """
-    conn = get_connection()
+    conn = get_connection(register_vec=False)  # don't register vector yet
     cur = conn.cursor()
 
-    # Enable pgvector extension (replaces ChromaDB)
+    # Enable pgvector extension first
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+    conn.commit()  # commit extension creation before using it
     cur.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";')
 
-    # Users table
+    # Users table (replaces Cosmos DB Users container)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -55,15 +60,16 @@ def init_db():
         );
     """)
 
-    # Stock embeddings — replaces ChromaDB
+    # Stock embeddings — replaces ChromaDB collection "stock_data"
+    # vector(1536) matches OpenAI text-embedding-3-small dimensions
     cur.execute("""
         CREATE TABLE IF NOT EXISTS stock_embeddings (
-            id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-            symbol     TEXT NOT NULL,
-            data_text  TEXT NOT NULL,
-            embedding  vector(1536),
-            metadata   JSONB DEFAULT '{}',
-            created_at TIMESTAMPTZ DEFAULT NOW()
+            id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            symbol          TEXT NOT NULL,
+            data_text       TEXT NOT NULL,
+            embedding       vector(1536),
+            metadata        JSONB DEFAULT '{}',
+            created_at      TIMESTAMPTZ DEFAULT NOW()
         );
     """)
 
@@ -83,16 +89,16 @@ def init_db():
     # Agent memory — long term memory per user
     cur.execute("""
         CREATE TABLE IF NOT EXISTS agent_memory (
-            id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-            user_id     UUID REFERENCES users(id) ON DELETE CASCADE,
-            memory_type TEXT DEFAULT 'fact',
-            content     TEXT NOT NULL,
-            embedding   vector(1536),
-            created_at  TIMESTAMPTZ DEFAULT NOW()
+            id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            user_id      UUID REFERENCES users(id) ON DELETE CASCADE,
+            memory_type  TEXT DEFAULT 'fact',
+            content      TEXT NOT NULL,
+            embedding    vector(1536),
+            created_at   TIMESTAMPTZ DEFAULT NOW()
         );
     """)
 
-    # Chat history
+    # Chat history — persists conversations across sessions
     cur.execute("""
         CREATE TABLE IF NOT EXISTS chat_history (
             id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -104,7 +110,7 @@ def init_db():
         );
     """)
 
-    # Price cache
+    # Price cache — avoids hammering Alpha Vantage on every request
     cur.execute("""
         CREATE TABLE IF NOT EXISTS price_cache (
             symbol     TEXT PRIMARY KEY,
@@ -136,10 +142,13 @@ def init_db():
     print("✅ PostgreSQL tables created successfully")
 
 
-# ── Vector search helpers ──────────────────────────────────────
+# ── Vector search helpers (replaces ChromaDB queries) ─────────
 def store_embedding(symbol: str, data_text: str,
                     embedding: list, metadata: dict = None):
-    """Store a stock data embedding. Replaces collection.add()"""
+    """
+    Store a stock data embedding.
+    Replaces: collection.add(embeddings=[...], documents=[...])
+    """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -153,7 +162,10 @@ def store_embedding(symbol: str, data_text: str,
 
 def search_similar(query_embedding: list, symbol: str = None,
                    limit: int = 5) -> list:
-    """Find similar stock data. Replaces collection.query()"""
+    """
+    Find semantically similar stock data using cosine similarity.
+    Replaces: collection.query(query_embeddings=[...], n_results=5)
+    """
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
