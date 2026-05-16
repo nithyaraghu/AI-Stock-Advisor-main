@@ -547,9 +547,26 @@ Not financial advice."""},
 # ── ORCHESTRATOR ──────────────────────────────────────────────
 
 def detect_intent(message):
-    prompt = f"""Return ONLY valid JSON. Question: "{message}"
-Fields: "agent" (technical/research/portfolio/sentiment/alert/general), "symbol" (ticker or null)
-Example: {{"agent":"technical","symbol":"AAPL"}}"""
+    prompt = f"""Return ONLY valid JSON. Classify this financial question.
+
+Question: "{message}"
+
+Rules:
+- "technical" = requests for technical analysis, chart analysis, indicators, buy/sell signals, RSI/MACD
+- "research" = requests for research, news, fundamentals, why is X moving
+- "portfolio" = questions about the user's portfolio, holdings, P&L
+- "sentiment" = questions about market sentiment, news sentiment
+- "alert" = requests to check alerts, warnings
+- "general" = simple price questions ("what is X price", "what is closing rate"), greetings, general chat, comparisons, recommendations
+
+Fields: "agent" (technical/research/portfolio/sentiment/alert/general), "symbol" (stock ticker or null)
+Examples:
+{{"agent":"technical","symbol":"AAPL"}} for "analyze AAPL" or "should I buy AAPL"
+{{"agent":"general","symbol":"AAPL"}} for "what is AAPL price" or "closing rate of apple"
+{{"agent":"general","symbol":null}} for "hello" or "what stocks should I watch"
+{{"agent":"portfolio","symbol":null}} for "how is my portfolio doing"
+
+Return ONLY the JSON, nothing else."""
     resp = client.chat.completions.create(
         model=MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=80)
     try:
@@ -580,15 +597,26 @@ def orchestrate(user_id, message):
     else:
         history = get_chat_history(user_id, 6)
         mem_ctx = "\n".join([f"- [{m['memory_type']}] {m['content']}" for m in memories])
-        system  = f"""You are Market Intelligence - a sharp AI stock advisor.
+        # If a symbol is mentioned, fetch live price for context
+        price_context = ""
+        if symbol:
+            try:
+                quote = fetch_stock_quote(symbol)
+                if quote.get("price", 0) > 0:
+                    price_context = f"\nLive data for {symbol}: Price=${quote['price']}, Change={quote['change_pct']:+.2f}%, Prev Close=${quote['prev_close']}"
+            except Exception:
+                pass
+        system  = f"""You are Market Intelligence - a friendly, conversational AI stock advisor.
 User: {prefs.get("name","Investor")} | Risk: {prefs.get("riskAppetite","Unknown")} | Goal: {prefs.get("investmentGoal","Unknown")}
 Known preferences: {mem_ctx or "None yet - learn from this conversation."}
-Be concise, specific, actionable. End financial advice with: Not financial advice."""
+{price_context}
+Be conversational and concise. Answer the specific question asked. For simple price questions just give the price directly.
+For complex questions, be insightful. End investment advice with: Not financial advice."""
         msgs = [{"role": "system", "content": system}] + \
                [{"role": h["role"], "content": h["message"]} for h in history[-4:]] + \
                [{"role": "user", "content": message}]
         response_text = client.chat.completions.create(
-            model=MODEL, messages=msgs, max_tokens=500).choices[0].message.content
+            model=MODEL, messages=msgs, max_tokens=300).choices[0].message.content
         agent = "general"
     save_message(user_id, "assistant", response_text, agent)
     return {"response": response_text, "agent_used": agent, "symbol": symbol, "intent": intent}
