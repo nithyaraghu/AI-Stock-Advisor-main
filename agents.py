@@ -565,6 +565,115 @@ Not financial advice."""},
     return client.chat.completions.create(model=MODEL, messages=messages, max_tokens=600).choices[0].message.content
 
 
+
+
+def portfolio_intel_agent(user_id, new_symbol):
+    """Analyze full portfolio risk, trends and sell timing after adding a stock."""
+    portfolio = get_user_portfolio(user_id)
+    prefs     = get_user_preferences(user_id)
+    if not portfolio:
+        return {"error": "No portfolio found"}
+
+    holdings_analysis = []
+    total_value = 0
+    total_cost  = 0
+    risk_scores = []
+
+    for h in portfolio:
+        sym    = h["symbol"]
+        prices = fetch_price_history(sym, "3mo")
+        quote  = fetch_stock_quote(sym)
+        price  = quote.get("price", h["avg_cost"])
+        ind    = compute_indicators(prices) if len(prices) >= 26 else {}
+
+        curr    = price * h["quantity"]
+        cost    = h["avg_cost"] * h["quantity"]
+        pnl     = curr - cost
+        pnl_pct = (pnl / cost * 100) if cost else 0
+        total_value += curr
+        total_cost  += cost
+
+        rsi  = ind.get("rsi", 50)
+        hist = ind.get("histogram", 0)
+        risk = 50
+        if rsi > 75:     risk += 25
+        elif rsi > 70:   risk += 15
+        elif rsi < 30:   risk -= 15
+        if hist < -0.5:  risk += 10
+        elif hist > 0.5: risk -= 10
+        if pnl_pct < -15: risk += 15
+        elif pnl_pct > 30: risk += 10
+        risk = max(0, min(100, risk))
+        risk_scores.append(risk)
+
+        signal = ind.get("overall", "HOLD")
+        trend  = "UPTREND" if hist > 0 and rsi < 70 else "DOWNTREND" if hist < 0 and rsi > 30 else "NEUTRAL"
+
+        holdings_analysis.append({
+            "symbol":  sym,
+            "price":   price,
+            "pnl_pct": round(pnl_pct, 2),
+            "rsi":     round(rsi, 1) if rsi else "N/A",
+            "signal":  signal,
+            "trend":   trend,
+            "risk":    risk,
+            "is_new":  sym == new_symbol.upper(),
+        })
+
+    portfolio_pnl = ((total_value - total_cost) / total_cost * 100) if total_cost else 0
+    avg_risk      = round(sum(risk_scores) / len(risk_scores)) if risk_scores else 50
+    risk_label    = "HIGH" if avg_risk > 65 else "MODERATE" if avg_risk > 40 else "LOW"
+
+    holdings_str = "\n".join([
+        f"- {h['symbol']}: Price=${h['price']}, P&L={h['pnl_pct']:+.1f}%, RSI={h['rsi']}, Signal={h['signal']}, Trend={h['trend']}, Risk={h['risk']}/100{'  <-- NEWLY ADDED' if h['is_new'] else ''}"
+        for h in holdings_analysis
+    ])
+
+    context = f"""User just added {new_symbol} to their portfolio.
+User profile: Risk appetite={prefs.get('riskAppetite','Unknown')}, Goal={prefs.get('investmentGoal','Unknown')}
+
+Current Portfolio (Total Value=${round(total_value,2)}, Total P&L={portfolio_pnl:+.1f}%):
+{holdings_str}
+
+Portfolio Risk Score: {avg_risk}/100 ({risk_label} RISK)"""
+
+    messages = [
+        {"role": "system", "content": """You are a portfolio intelligence AI. The user just added a stock.
+Give a sharp, actionable analysis in this EXACT format:
+
+## PORTFOLIO INTELLIGENCE REPORT
+
+### Overall Risk: [LOW/MODERATE/HIGH] ([score]/100)
+[1 sentence on overall portfolio health]
+
+### Newly Added: {SYMBOL}
+[2-3 sentences: why this stock fits or does not fit the portfolio, what to watch]
+
+### Portfolio Trends
+[For each stock with a strong signal, one bullet: symbol, direction, brief reason]
+
+### Sell Recommendations
+[List 1-3 specific stocks with suggested sell conditions]
+
+### Best Timing Window
+[1-2 sentences on ideal timing to review or rebalance]
+
+Keep it concise and actionable. Not financial advice."""},
+        {"role": "user", "content": context}
+    ]
+
+    response = client.chat.completions.create(
+        model=MODEL, messages=messages, max_tokens=700).choices[0].message.content
+
+    return {
+        "response":      response,
+        "risk_score":    avg_risk,
+        "risk_label":    risk_label,
+        "portfolio_pnl": round(portfolio_pnl, 2),
+        "total_value":   round(total_value, 2),
+        "holdings":      holdings_analysis,
+    }
+
 # - ORCHESTRATOR -
 
 def detect_intent(message):
