@@ -507,7 +507,8 @@ def create_app():
             return jsonify({"error": "user_id required"}), 400
         try:
             from agents import portfolio_intel_agent
-            result = portfolio_intel_agent(user_id, symbol)
+            removed = data.get('removed_symbol')
+            result = portfolio_intel_agent(user_id, symbol, removed_symbol=removed)
             return jsonify(result), 200
         except Exception as e:
             import traceback
