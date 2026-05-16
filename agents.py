@@ -164,10 +164,31 @@ def fetch_stock_quote(symbol):
 
 
 def fetch_price_history(symbol, period="3mo"):
-    """Fetch price history - Polygon first, yfinance fallback."""
+    """Fetch price history - Twelve Data first, Polygon fallback, yfinance last."""
     sym = symbol.upper()
 
-    # 1. Polygon
+    # 1. Twelve Data - 800 req/day, no per-minute limit issues
+    twelve_key = os.environ.get("TWELVE_DATA_API_KEY", "")
+    if twelve_key:
+        try:
+            period_map = {'5d': 5, '1mo': 30, '3mo': 90, '6mo': 180, '1y': 365}
+            outputsize = period_map.get(period, 90)
+            url = (f"https://api.twelvedata.com/time_series?symbol={sym}"
+                   f"&interval=1day&outputsize={outputsize}&apikey={twelve_key}")
+            r = requests.get(url, timeout=15).json()
+            values = r.get("values", [])
+            if values:
+                data = [{"date":   v["datetime"],
+                         "close":  round(float(v["close"]), 2),
+                         "high":   round(float(v["high"]), 2),
+                         "low":    round(float(v["low"]), 2),
+                         "volume": int(float(v.get("volume", 0)))}
+                        for v in reversed(values)]
+                return data
+        except Exception:
+            pass
+
+    # 2. Polygon fallback
     if POLYGON_KEY:
         try:
             from datetime import date, timedelta
@@ -178,17 +199,17 @@ def fetch_price_history(symbol, period="3mo"):
             url   = (f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day/"
                      f"{start}/{end}?adjusted=true&sort=asc&limit=500&apiKey={POLYGON_KEY}")
             r = requests.get(url, timeout=15).json()
-            results = r.get('results', [])
+            results = r.get("results", [])
             if results:
-                return [{"date": datetime.datetime.fromtimestamp(d['t']/1000).strftime('%Y-%m-%d'),
-                         "close": round(d.get('c', 0), 2),
-                         "high":  round(d.get('h', 0), 2),
-                         "low":   round(d.get('l', 0), 2),
-                         "volume": int(d.get('v', 0))} for d in results]
+                return [{"date": datetime.datetime.fromtimestamp(d["t"]/1000).strftime("%Y-%m-%d"),
+                         "close": round(d.get("c", 0), 2),
+                         "high":  round(d.get("h", 0), 2),
+                         "low":   round(d.get("l", 0), 2),
+                         "volume": int(d.get("v", 0))} for d in results]
         except Exception:
             pass
 
-    # 2. yfinance fallback
+    # 3. yfinance last resort
     try:
         import yfinance as yf
         hist = yf.Ticker(sym).history(period=period, interval="1d")
