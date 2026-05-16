@@ -487,16 +487,31 @@ def create_app():
         """Analyze portfolio risk and trends after adding a stock."""
         data    = request.get_json()
         user_id = data.get('user_id')
-        symbol  = data.get('symbol')  # newly added stock
-        if not user_id or not symbol:
-            return jsonify({"error": "user_id and symbol required"}), 400
+        symbol  = data.get('symbol')
+        email   = data.get('email')
+        if not symbol:
+            return jsonify({"error": "symbol required"}), 400
+        # Resolve email to UUID if needed
+        if not user_id or '@' in str(user_id):
+            lookup_email = email or user_id
+            if lookup_email:
+                conn = get_connection(); cur = get_cursor(conn)
+                try:
+                    cur.execute("SELECT id FROM users WHERE email = %s", (lookup_email,))
+                    row = cur.fetchone()
+                    if row:
+                        user_id = str(row['id'])
+                finally:
+                    cur.close(); conn.close()
+        if not user_id:
+            return jsonify({"error": "user_id required"}), 400
         try:
             from agents import portfolio_intel_agent
             result = portfolio_intel_agent(user_id, symbol)
             return jsonify(result), 200
         except Exception as e:
             import traceback
-            return jsonify({"error": str(e), "detail": traceback.format_exc()[-300:]}), 500
+            return jsonify({"error": str(e), "detail": traceback.format_exc()[-500:]}), 500
 
     # -------------- Chat Routes --------------
 

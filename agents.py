@@ -569,6 +569,18 @@ Not financial advice."""},
 
 def portfolio_intel_agent(user_id, new_symbol):
     """Analyze full portfolio risk, trends and sell timing after adding a stock."""
+    import re
+    # If user_id looks like an email, look up the actual UUID first
+    if user_id and "@" in str(user_id):
+        conn = get_connection(); cur = get_cursor(conn)
+        try:
+            cur.execute("SELECT id FROM users WHERE email = %s", (user_id,))
+            row = cur.fetchone()
+            if row:
+                user_id = str(row["id"])
+        finally:
+            cur.close(); conn.close()
+
     portfolio = get_user_portfolio(user_id)
     prefs     = get_user_preferences(user_id)
     if not portfolio:
