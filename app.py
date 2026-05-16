@@ -481,6 +481,23 @@ def create_app():
         except Exception as e:
             return jsonify({'articles': [], 'error': str(e)}), 200
 
+
+    @app.route('/portfolio/analyze', methods=['POST'])
+    def analyze_portfolio():
+        """Analyze portfolio risk and trends after adding a stock."""
+        data    = request.get_json()
+        user_id = data.get('user_id')
+        symbol  = data.get('symbol')  # newly added stock
+        if not user_id or not symbol:
+            return jsonify({"error": "user_id and symbol required"}), 400
+        try:
+            from agents import portfolio_intel_agent
+            result = portfolio_intel_agent(user_id, symbol)
+            return jsonify(result), 200
+        except Exception as e:
+            import traceback
+            return jsonify({"error": str(e), "detail": traceback.format_exc()[-300:]}), 500
+
     # -------------- Chat Routes --------------
 
     @app.route('/chat', methods=['POST'])
