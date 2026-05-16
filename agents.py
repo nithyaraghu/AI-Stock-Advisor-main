@@ -1,5 +1,5 @@
 """
-agents.py — Enhanced Agentic AI System v2
+agents.py - Enhanced Agentic AI System v2
 ==========================================
 - Structured BUY/SELL/HOLD responses with confidence scores
 - Smart PostgreSQL memory across sessions
@@ -29,7 +29,7 @@ COMPANY_NAMES = {
 }
 
 
-# ── MEMORY ────────────────────────────────────────────────────
+# - MEMORY -
 
 def save_message(user_id, role, message, agent_used=None):
     conn = get_connection(); cur = conn.cursor()
@@ -107,13 +107,13 @@ def extract_and_save_preferences(user_id, message):
             break
 
 
-# ── DATA & INDICATORS ─────────────────────────────────────────
+# - DATA & INDICATORS -
 
 def fetch_stock_quote(symbol):
-    """Fetch live quote — Finnhub first, Polygon fallback, yfinance last."""
+    """Fetch live quote - Finnhub first, Polygon fallback, yfinance last."""
     sym = symbol.upper()
 
-    # 1. Finnhub — 60 req/min free
+    # 1. Finnhub - 60 req/min free
     finnhub_key = os.environ.get("FINNHUB_API_KEY", "")
     if finnhub_key:
         try:
@@ -164,7 +164,7 @@ def fetch_stock_quote(symbol):
 
 
 def fetch_price_history(symbol, period="3mo"):
-    """Fetch price history — Polygon first, yfinance fallback."""
+    """Fetch price history - Polygon first, yfinance fallback."""
     sym = symbol.upper()
 
     # 1. Polygon
@@ -281,7 +281,7 @@ def compute_indicators(prices):
             "price": round(price, 2), "signals": signals, "overall": overall, "confidence": confidence}
 
 
-# ── EMAIL ─────────────────────────────────────────────────────
+# - EMAIL -
 
 def send_email_alert(subject, body_html, receiver=None):
     if not EMAIL_SENDER or not EMAIL_PASSWORD:
@@ -328,7 +328,7 @@ def format_alert_email(alerts, user_name="Investor"):
 </body></html>"""
 
 
-# ── SPECIALIST AGENTS ─────────────────────────────────────────
+# - SPECIALIST AGENTS -
 
 def technical_agent(symbol, question):
     prices = fetch_price_history(symbol)
@@ -544,7 +544,7 @@ Not financial advice."""},
     return client.chat.completions.create(model=MODEL, messages=messages, max_tokens=600).choices[0].message.content
 
 
-# ── ORCHESTRATOR ──────────────────────────────────────────────
+# - ORCHESTRATOR -
 
 def detect_intent(message):
     prompt = f"""Return ONLY valid JSON. Classify this financial question.
