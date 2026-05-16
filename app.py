@@ -62,6 +62,21 @@ def create_app():
             'DATABASE_URL':    'SET' if os.environ.get('DATABASE_URL') else 'MISSING',
         })
 
+    @app.route('/debug/history')
+    def debug_history():
+        """Test what fetch_price_history returns for AAPL."""
+        try:
+            from agents import fetch_price_history
+            data = fetch_price_history('AAPL', '3mo')
+            return jsonify({
+                'count': len(data),
+                'first': data[0] if data else None,
+                'last': data[-1] if data else None,
+                'polygon_key': 'SET' if os.environ.get('POLYGON_API_KEY') else 'MISSING',
+            })
+        except Exception as e:
+            return jsonify({'error': str(e)})
+
     @app.route('/debug/polygon')
     def debug_polygon():
         """Test Polygon API response."""
