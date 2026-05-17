@@ -83,6 +83,19 @@ def create_app():
         except Exception as e:
             return jsonify({'error': str(e)})
 
+    @app.route('/debug/twelvedata')
+    def debug_twelvedata():
+        """Test Twelve Data API response."""
+        TWELVE_KEY = os.environ.get('TWELVE_DATA_API_KEY', '')
+        if not TWELVE_KEY:
+            return jsonify({'error': 'TWELVE_DATA_API_KEY not set'})
+        try:
+            url = f"https://api.twelvedata.com/time_series?symbol=AAPL&interval=1day&outputsize=5&apikey={TWELVE_KEY}"
+            r = requests.get(url, timeout=15).json()
+            return jsonify({'twelve_data': r})
+        except Exception as e:
+            return jsonify({'error': str(e)})
+
     @app.route('/debug/polygon')
     def debug_polygon():
         """Test Polygon API response."""
