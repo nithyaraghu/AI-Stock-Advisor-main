@@ -332,43 +332,64 @@ def create_app():
         if not symbol:
             return jsonify({'error': 'Please provide symbol'}), 400
         try:
+            sym = symbol.upper()
+            period_days = {'5d': 5, '1mo': 30, '3mo': 90, '6mo': 180, '1y': 365, '2y': 730}
+
+            # 1. Twelve Data - 800 req/day, no per-minute rate limit issues
+            TWELVE_KEY = os.environ.get('TWELVE_DATA_API_KEY', '')
+            if TWELVE_KEY:
+                try:
+                    outputsize = period_days.get(period, 90)
+                    td_interval = '1day' if interval == '1d' else '1week' if interval == '1wk' else '1h'
+                    url = (f"https://api.twelvedata.com/time_series?symbol={sym}"
+                           f"&interval={td_interval}&outputsize={outputsize}&apikey={TWELVE_KEY}")
+                    r = requests.get(url, timeout=15).json()
+                    values = r.get('values', [])
+                    if values:
+                        data = [{'time':   v['datetime'][:10],
+                                 'open':   round(float(v['open']), 2),
+                                 'high':   round(float(v['high']), 2),
+                                 'low':    round(float(v['low']), 2),
+                                 'close':  round(float(v['close']), 2),
+                                 'volume': int(float(v.get('volume', 0)))}
+                                for v in reversed(values)]
+                        return jsonify({'symbol': sym, 'data': data})
+                except Exception:
+                    pass
+
+            # 2. Polygon fallback
             if POLYGON_KEY:
-                # Convert period to date range
-                from datetime import date, timedelta
-                period_days = {
-                    '5d': 5, '1mo': 30, '3mo': 90,
-                    '6mo': 180, '1y': 365, '2y': 730
-                }
-                days = period_days.get(period, 90)
-                end   = date.today()
-                start = end - timedelta(days=days)
-                # Map interval
-                timespan = 'day' if interval == '1d' else 'week' if interval == '1wk' else 'hour'
-                url = (f"https://api.polygon.io/v2/aggs/ticker/{symbol.upper()}/range/1/{timespan}/"
-                       f"{start}/{end}?adjusted=true&sort=asc&limit=500&apiKey={POLYGON_KEY}")
-                r = requests.get(url, timeout=15).json()
-                results = r.get('results', [])
-                if not results:
-                    return jsonify({'error': 'No data found'}), 404
-                data = [{
-                    'time':   datetime.datetime.fromtimestamp(d['t']/1000).strftime('%Y-%m-%d'),
-                    'open':   round(d.get('o', 0), 2),
-                    'high':   round(d.get('h', 0), 2),
-                    'low':    round(d.get('l', 0), 2),
-                    'close':  round(d.get('c', 0), 2),
-                    'volume': int(d.get('v', 0)),
-                } for d in results]
-                return jsonify({'symbol': symbol.upper(), 'data': data})
-            # Fallback to yfinance
+                try:
+                    from datetime import date, timedelta
+                    days  = period_days.get(period, 90)
+                    end   = date.today()
+                    start = end - timedelta(days=days)
+                    timespan = 'day' if interval == '1d' else 'week' if interval == '1wk' else 'hour'
+                    url = (f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/{timespan}/"
+                           f"{start}/{end}?adjusted=true&sort=asc&limit=500&apiKey={POLYGON_KEY}")
+                    r = requests.get(url, timeout=15).json()
+                    results = r.get('results', [])
+                    if results:
+                        data = [{'time':   datetime.datetime.fromtimestamp(d['t']/1000).strftime('%Y-%m-%d'),
+                                 'open':   round(d.get('o', 0), 2),
+                                 'high':   round(d.get('h', 0), 2),
+                                 'low':    round(d.get('l', 0), 2),
+                                 'close':  round(d.get('c', 0), 2),
+                                 'volume': int(d.get('v', 0))} for d in results]
+                        return jsonify({'symbol': sym, 'data': data})
+                except Exception:
+                    pass
+
+            # 3. yfinance last resort
             import yfinance as yf
-            hist = yf.Ticker(symbol.upper()).history(period=period, interval=interval)
+            hist = yf.Ticker(sym).history(period=period, interval=interval)
             if hist.empty:
                 return jsonify({'error': 'No data found'}), 404
-            data = [{'time': str(date)[:10], 'open': round(float(row['Open']), 2),
+            data = [{'time': str(d)[:10], 'open': round(float(row['Open']), 2),
                      'high': round(float(row['High']), 2), 'low': round(float(row['Low']), 2),
                      'close': round(float(row['Close']), 2), 'volume': int(row['Volume'])}
-                    for date, row in hist.iterrows()]
-            return jsonify({'symbol': symbol.upper(), 'data': data})
+                    for d, row in hist.iterrows()]
+            return jsonify({'symbol': sym, 'data': data})
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
