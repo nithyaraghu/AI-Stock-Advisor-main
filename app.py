@@ -61,7 +61,8 @@ def create_app():
         return jsonify({
             'NEWS_API_KEY':    'SET' if os.environ.get('NEWS_API_KEY') else 'MISSING',
             'POLYGON_API_KEY': 'SET' if os.environ.get('POLYGON_API_KEY') else 'MISSING',
-            'FINNHUB_API_KEY': 'SET' if os.environ.get('FINNHUB_API_KEY') else 'MISSING',
+            'FINNHUB_API_KEY':     'SET' if os.environ.get('FINNHUB_API_KEY') else 'MISSING',
+            'TWELVE_DATA_API_KEY': 'SET' if os.environ.get('TWELVE_DATA_API_KEY') else 'MISSING',
             'GROQ_API_KEY':    'SET' if os.environ.get('GROQ_API_KEY') else 'MISSING',
             'DATABASE_URL':    'SET' if os.environ.get('DATABASE_URL') else 'MISSING',
             'agents_has_polygon_history': has_polygon,
