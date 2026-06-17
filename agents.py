@@ -771,6 +771,16 @@ For complex questions, be insightful. End investment advice with: Not financial 
                [{"role": "user", "content": message}]
         response_text = client.chat.completions.create(
             model=MODEL, messages=msgs, max_tokens=300).choices[0].message.content
+        # Deterministic safeguard: guarantee the index/ETF caveat regardless of what the LLM said.
+        # The prompt asks the model to flag this, but at temperature it may skip it - so we enforce it in code.
+        if symbol and symbol.upper() in INDEX_ETFS:
+            index_name, _ = INDEX_ETFS[symbol.upper()]
+            caveat_marker = f"{symbol.upper()}"
+            # Only append if the model didn't already clearly flag the ETF/index distinction
+            if "ETF" not in response_text or index_name.split()[0] not in response_text:
+                response_text += (f"\n\nNote: This price is for the {symbol.upper()} ETF, "
+                                  f"which tracks but is NOT the same as the {index_name} level "
+                                  f"(the index is a different, much larger number).")
         agent = "general"
     save_message(user_id, "assistant", response_text, agent)
     return {"response": response_text, "agent_used": agent, "symbol": symbol, "intent": intent}
