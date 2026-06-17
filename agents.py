@@ -736,6 +736,14 @@ def orchestrate(user_id, message):
     else:
         history = get_chat_history(user_id, 6)
         mem_ctx = "\n".join([f"- [{m['memory_type']}] {m['content']}" for m in memories])
+        # Known index ETFs that are NOT the same as the index they track
+        INDEX_ETFS = {
+            "SPY": ("S&P 500 index", "the SPDR S&P 500 ETF (about 1/10th the index level)"),
+            "VOO": ("S&P 500 index", "the Vanguard S&P 500 ETF (about 1/10th the index level)"),
+            "QQQ": ("Nasdaq-100 index", "the Invesco QQQ ETF (not the index level)"),
+            "DIA": ("Dow Jones index", "the SPDR Dow Jones ETF (about 1/100th the index level)"),
+            "IWM": ("Russell 2000 index", "the iShares Russell 2000 ETF (not the index level)"),
+        }
         # If a symbol is mentioned, fetch live price for context
         price_context = ""
         if symbol:
@@ -743,6 +751,13 @@ def orchestrate(user_id, message):
                 quote = fetch_stock_quote(symbol)
                 if quote.get("price", 0) > 0:
                     price_context = f"\nLive data for {symbol}: Price=${quote['price']}, Change={quote['change_pct']:+.2f}%, Prev Close=${quote['prev_close']}"
+                    # Flag index/ETF distinction so the agent never passes off an ETF price as the index value
+                    if symbol.upper() in INDEX_ETFS:
+                        index_name, etf_desc = INDEX_ETFS[symbol.upper()]
+                        price_context += (f"\nIMPORTANT: This price is for {symbol.upper()}, which is {etf_desc}. "
+                                          f"It is NOT the same number as {index_name}. If the user asked about "
+                                          f"{index_name}, clearly tell them this is the ETF price and that the index "
+                                          f"level is a different (much larger) number you cannot fetch directly.")
             except Exception:
                 pass
         system  = f"""You are Market Intelligence - a friendly, conversational AI stock advisor.
