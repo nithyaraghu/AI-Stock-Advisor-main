@@ -28,6 +28,17 @@ COMPANY_NAMES = {
     'PYPL':'PayPal','UBER':'Uber','SHOP':'Shopify','PLTR':'Palantir',
 }
 
+# Index ETFs - their price is NOT the same as the index level they track.
+# The app has no live feed for index levels, so any index number must not be fabricated.
+INDEX_ETFS = {
+    "SPY": ("S&P 500 index", "the SPDR S&P 500 ETF"),
+    "VOO": ("S&P 500 index", "the Vanguard S&P 500 ETF"),
+    "QQQ": ("Nasdaq-100 index", "the Invesco QQQ ETF"),
+    "DIA": ("Dow Jones index", "the SPDR Dow Jones ETF"),
+    "IWM": ("Russell 2000 index", "the iShares Russell 2000 ETF"),
+}
+
+
 
 # - MEMORY -
 
@@ -736,14 +747,6 @@ def orchestrate(user_id, message):
     else:
         history = get_chat_history(user_id, 6)
         mem_ctx = "\n".join([f"- [{m['memory_type']}] {m['content']}" for m in memories])
-        # Known index ETFs that are NOT the same as the index they track
-        INDEX_ETFS = {
-            "SPY": ("S&P 500 index", "the SPDR S&P 500 ETF (about 1/10th the index level)"),
-            "VOO": ("S&P 500 index", "the Vanguard S&P 500 ETF (about 1/10th the index level)"),
-            "QQQ": ("Nasdaq-100 index", "the Invesco QQQ ETF (not the index level)"),
-            "DIA": ("Dow Jones index", "the SPDR Dow Jones ETF (about 1/100th the index level)"),
-            "IWM": ("Russell 2000 index", "the iShares Russell 2000 ETF (not the index level)"),
-        }
         # If a symbol is mentioned, fetch live price for context
         price_context = ""
         if symbol:
@@ -771,16 +774,63 @@ For complex questions, be insightful. End investment advice with: Not financial 
                [{"role": "user", "content": message}]
         response_text = client.chat.completions.create(
             model=MODEL, messages=msgs, max_tokens=300).choices[0].message.content
-        # Deterministic safeguard: guarantee the index/ETF caveat regardless of what the LLM said.
-        # The prompt asks the model to flag this, but at temperature it may skip it - so we enforce it in code.
+        # Deterministic safeguard for index ETFs.
+        # Root cause: the app has the ETF price but NO source for the actual index level.
+        # So any index number the LLM volunteers is fabricated (from memory/rule-of-thumb).
+        # Fix: when the symbol is an index ETF, replace the entire response with a sourced,
+        # honest answer that states only what we can actually verify - the ETF price - and
+        # explicitly declines to give an index level we cannot fetch.
         if symbol and symbol.upper() in INDEX_ETFS:
-            index_name, _ = INDEX_ETFS[symbol.upper()]
-            caveat_marker = f"{symbol.upper()}"
-            # Only append if the model didn't already clearly flag the ETF/index distinction
-            if "ETF" not in response_text or index_name.split()[0] not in response_text:
-                response_text += (f"\n\nNote: This price is for the {symbol.upper()} ETF, "
-                                  f"which tracks but is NOT the same as the {index_name} level "
-                                  f"(the index is a different, much larger number).")
+            index_name, etf_desc = INDEX_ETFS[symbol.upper()]
+            try:
+                etf_quote = fetch_stock_quote(symbol)
+                etf_price = etf_quote.get("price", 0)
+                etf_chg   = etf_quote.get("change_pct", 0)
+            except Exception:
+                etf_price = 0
+                etf_chg   = 0
+            if etf_price > 0:
+                response_text = (
+                    f"I can show you {symbol.upper()} ({etf_desc}): "
+                    f"${etf_price} ({etf_chg:+.2f}% today).\n\n"
+                    f"Note: {symbol.upper()} tracks the {index_name} but is a different instrument - "
+                    f"its price is not the index level. I don't have a live feed for the {index_name} "
+                    f"value itself, so I won't estimate it (a rule-of-thumb multiplier would be a guess, "
+                    f"not real data). For the exact index level, check a source like Google Finance or your broker.\n\n"
+                    f"Not financial advice."
+                )
+            else:
+                response_text = (
+                    f"I track {symbol.upper()} ({etf_desc}), which follows the {index_name}, "
+                    f"but I don't currently have a live price for it, and I don't have a direct feed "
+                    f"for the {index_name} index level itself. Please check a market data source for the current value.\n\n"
+                    f"Not financial advice."
+                )
         agent = "general"
+
+    # CATCH-ALL deterministic guard: no matter which agent ran, if the symbol is an
+    # index ETF, ensure we never pass off the ETF price as the index level or let a
+    # fabricated index number through. This fires even if detect_intent routed the
+    # query to technical/research instead of general.
+    if symbol and symbol.upper() in INDEX_ETFS:
+        index_name, etf_desc = INDEX_ETFS[symbol.upper()]
+        # If the response doesn't already make the ETF-vs-index distinction clear, override it.
+        rt_lower = response_text.lower()
+        makes_distinction = ("etf" in rt_lower and "not" in rt_lower and "index" in rt_lower)
+        if not makes_distinction:
+            try:
+                etf_quote = fetch_stock_quote(symbol)
+                etf_price = etf_quote.get("price", 0)
+                etf_chg   = etf_quote.get("change_pct", 0)
+            except Exception:
+                etf_price = 0; etf_chg = 0
+            if etf_price > 0:
+                response_text = (
+                    f"I can show you {symbol.upper()} ({etf_desc}): ${etf_price} ({etf_chg:+.2f}% today). "
+                    f"It tracks the {index_name} but is a different instrument - its price is not the index level. "
+                    f"I don't have a live feed for the {index_name} value itself, so I won't estimate it. "
+                    f"For the exact index level, check a market data source.\n\nNot financial advice."
+                )
+
     save_message(user_id, "assistant", response_text, agent)
     return {"response": response_text, "agent_used": agent, "symbol": symbol, "intent": intent}
