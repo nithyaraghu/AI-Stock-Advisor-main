@@ -788,34 +788,34 @@ For complex questions, be insightful. End investment advice with: Not financial 
         agent = "general"
 
     # CATCH-ALL deterministic guard: no matter which agent ran, if the symbol is an
-    # index ETF, ensure we never pass off the ETF price as the index level or let a
-    # fabricated index number through. This fires even if detect_intent routed the
-    # query to technical/research instead of general.
+    # index ETF, ALWAYS replace the response with a sourced answer. We do not try to
+    # judge whether the model "made the distinction" - a response can name the ETF and
+    # still volunteer a fabricated index estimate (e.g. "around 10x the price"). The only
+    # safe rule is: report the verifiable ETF price and refuse to state an index level
+    # we cannot source. This fires for any agent (general/technical/research).
     if symbol and symbol.upper() in INDEX_ETFS:
         index_name, etf_desc = INDEX_ETFS[symbol.upper()]
-        # If the response doesn't already make the ETF-vs-index distinction clear, override it.
-        rt_lower = response_text.lower()
-        makes_distinction = ("etf" in rt_lower and "not" in rt_lower and "index" in rt_lower)
-        if not makes_distinction:
-            try:
-                etf_quote = fetch_stock_quote(symbol)
-                etf_price = etf_quote.get("price", 0)
-                etf_chg   = etf_quote.get("change_pct", 0)
-            except Exception:
-                etf_price = 0; etf_chg = 0
-            if etf_price > 0:
-                response_text = (
-                    f"I can show you {symbol.upper()} ({etf_desc}): ${etf_price} ({etf_chg:+.2f}% today). "
-                    f"It tracks the {index_name} but is a different instrument - its price is not the index level. "
-                    f"I don't have a live feed for the {index_name} value itself, so I won't estimate it. "
-                    f"For the exact index level, check a market data source.\n\nNot financial advice."
-                )
-            else:
-                response_text = (
-                    f"I don't have a live feed for the {index_name} level itself, and I won't estimate it "
-                    f"(a multiplier off the tracking ETF would be a guess, not real data). "
-                    f"Please check a market data source like Google Finance for the current value.\n\nNot financial advice."
-                )
+        try:
+            etf_quote = fetch_stock_quote(symbol)
+            etf_price = etf_quote.get("price", 0)
+            etf_chg   = etf_quote.get("change_pct", 0)
+        except Exception:
+            etf_price = 0
+            etf_chg   = 0
+        if etf_price > 0:
+            response_text = (
+                f"I can show you {symbol.upper()} ({etf_desc}): ${etf_price} ({etf_chg:+.2f}% today). "
+                f"It tracks the {index_name} but is a different instrument - its price is not the index level. "
+                f"I don't have a live feed for the {index_name} value itself, so I won't estimate it "
+                f"(a multiplier off the ETF would be a guess, not real data). "
+                f"For the exact index level, check a market data source like Google Finance.\n\nNot financial advice."
+            )
+        else:
+            response_text = (
+                f"I don't have a live feed for the {index_name} level itself, and I won't estimate it "
+                f"(a multiplier off the tracking ETF would be a guess, not real data). "
+                f"Please check a market data source like Google Finance for the current value.\n\nNot financial advice."
+            )
 
     save_message(user_id, "assistant", response_text, agent)
     return {"response": response_text, "agent_used": agent, "symbol": symbol, "intent": intent}
