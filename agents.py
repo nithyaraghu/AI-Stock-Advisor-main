@@ -31,11 +31,22 @@ COMPANY_NAMES = {
 # Index ETFs - their price is NOT the same as the index level they track.
 # The app has no live feed for index levels, so any index number must not be fabricated.
 INDEX_ETFS = {
-    "SPY": ("S&P 500 index", "the SPDR S&P 500 ETF"),
-    "VOO": ("S&P 500 index", "the Vanguard S&P 500 ETF"),
-    "QQQ": ("Nasdaq-100 index", "the Invesco QQQ ETF"),
-    "DIA": ("Dow Jones index", "the SPDR Dow Jones ETF"),
-    "IWM": ("Russell 2000 index", "the iShares Russell 2000 ETF"),
+    "SPY":   ("S&P 500 index", "the SPDR S&P 500 ETF"),
+    "VOO":   ("S&P 500 index", "the Vanguard S&P 500 ETF"),
+    "QQQ":   ("Nasdaq-100 index", "the Invesco QQQ ETF"),
+    "DIA":   ("Dow Jones index", "the SPDR Dow Jones ETF"),
+    "IWM":   ("Russell 2000 index", "the iShares Russell 2000 ETF"),
+    # Aliases the LLM may emit when it tries to name the index directly (router misfires).
+    # These are not valid tradable tickers in our pipeline, so we map them to the
+    # tracking ETF and let the guard give the honest "I can't fetch the index level" answer.
+    "SP500": ("S&P 500 index", "the S&P 500 (tracked by the SPY ETF)"),
+    "^GSPC": ("S&P 500 index", "the S&P 500 (tracked by the SPY ETF)"),
+    ".INX":  ("S&P 500 index", "the S&P 500 (tracked by the SPY ETF)"),
+    "GSPC":  ("S&P 500 index", "the S&P 500 (tracked by the SPY ETF)"),
+    "NDX":   ("Nasdaq-100 index", "the Nasdaq-100 (tracked by the QQQ ETF)"),
+    "^IXIC": ("Nasdaq Composite index", "the Nasdaq (tracked by the QQQ ETF)"),
+    "DJI":   ("Dow Jones index", "the Dow Jones (tracked by the DIA ETF)"),
+    "^DJI":  ("Dow Jones index", "the Dow Jones (tracked by the DIA ETF)"),
 }
 
 
@@ -830,6 +841,12 @@ For complex questions, be insightful. End investment advice with: Not financial 
                     f"It tracks the {index_name} but is a different instrument - its price is not the index level. "
                     f"I don't have a live feed for the {index_name} value itself, so I won't estimate it. "
                     f"For the exact index level, check a market data source.\n\nNot financial advice."
+                )
+            else:
+                response_text = (
+                    f"I don't have a live feed for the {index_name} level itself, and I won't estimate it "
+                    f"(a multiplier off the tracking ETF would be a guess, not real data). "
+                    f"Please check a market data source like Google Finance for the current value.\n\nNot financial advice."
                 )
 
     save_message(user_id, "assistant", response_text, agent)
