@@ -787,35 +787,45 @@ For complex questions, be insightful. End investment advice with: Not financial 
             model=MODEL, messages=msgs, max_tokens=300).choices[0].message.content
         agent = "general"
 
-    # CATCH-ALL deterministic guard: no matter which agent ran, if the symbol is an
-    # index ETF, ALWAYS replace the response with a sourced answer. We do not try to
-    # judge whether the model "made the distinction" - a response can name the ETF and
-    # still volunteer a fabricated index estimate (e.g. "around 10x the price"). The only
-    # safe rule is: report the verifiable ETF price and refuse to state an index level
-    # we cannot source. This fires for any agent (general/technical/research).
-    if symbol and symbol.upper() in INDEX_ETFS:
-        index_name, etf_desc = INDEX_ETFS[symbol.upper()]
+    # CATCH-ALL deterministic guard against fabricated numbers.
+    # Root insight: a denylist of known index names (SPY, QQQ, "Nasdaq"...) is always
+    # incomplete - the LLM can emit "Nasdaq", "IXIC", "COMP", etc. and slip through.
+    # So we invert the logic: if a symbol was identified but we have NO live price for it,
+    # the agent must NOT state a numeric level for it (that number would be fabricated).
+    # This catches any unfetchable symbol - known index aliases, fake tickers, anything -
+    # without enumerating them. Fires for any agent.
+    if symbol:
+        sym = symbol.upper()
+        is_index_etf = sym in INDEX_ETFS
         try:
-            etf_quote = fetch_stock_quote(symbol)
-            etf_price = etf_quote.get("price", 0)
-            etf_chg   = etf_quote.get("change_pct", 0)
+            chk_quote = fetch_stock_quote(symbol)
+            chk_price = chk_quote.get("price", 0)
+            chk_chg   = chk_quote.get("change_pct", 0)
         except Exception:
-            etf_price = 0
-            etf_chg   = 0
-        if etf_price > 0:
+            chk_price = 0
+            chk_chg   = 0
+
+        if is_index_etf and chk_price > 0:
+            # Known index ETF with a real price: report the ETF price, refuse the index level.
+            index_name, etf_desc = INDEX_ETFS[sym]
             response_text = (
-                f"I can show you {symbol.upper()} ({etf_desc}): ${etf_price} ({etf_chg:+.2f}% today). "
+                f"I can show you {sym} ({etf_desc}): ${chk_price} ({chk_chg:+.2f}% today). "
                 f"It tracks the {index_name} but is a different instrument - its price is not the index level. "
                 f"I don't have a live feed for the {index_name} value itself, so I won't estimate it "
                 f"(a multiplier off the ETF would be a guess, not real data). "
                 f"For the exact index level, check a market data source like Google Finance.\n\nNot financial advice."
             )
-        else:
+        elif chk_price <= 0:
+            # We could not fetch a real price for this symbol. Any number the model gave is
+            # unsourced, so override with an honest refusal. This is what catches "Nasdaq",
+            # "Dow", fake tickers, and any index name not in our ETF map.
+            label = INDEX_ETFS[sym][0] if is_index_etf else sym
             response_text = (
-                f"I don't have a live feed for the {index_name} level itself, and I won't estimate it "
-                f"(a multiplier off the tracking ETF would be a guess, not real data). "
+                f"I don't have live data for {label} right now, so I can't give you a current "
+                f"figure - any number I stated would be a guess rather than real-time data. "
                 f"Please check a market data source like Google Finance for the current value.\n\nNot financial advice."
             )
+        # else: real, non-index stock with a valid price - leave the agent's answer as-is.
 
     save_message(user_id, "assistant", response_text, agent)
     return {"response": response_text, "agent_used": agent, "symbol": symbol, "intent": intent}
