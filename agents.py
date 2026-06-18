@@ -785,38 +785,6 @@ For complex questions, be insightful. End investment advice with: Not financial 
                [{"role": "user", "content": message}]
         response_text = client.chat.completions.create(
             model=MODEL, messages=msgs, max_tokens=300).choices[0].message.content
-        # Deterministic safeguard for index ETFs.
-        # Root cause: the app has the ETF price but NO source for the actual index level.
-        # So any index number the LLM volunteers is fabricated (from memory/rule-of-thumb).
-        # Fix: when the symbol is an index ETF, replace the entire response with a sourced,
-        # honest answer that states only what we can actually verify - the ETF price - and
-        # explicitly declines to give an index level we cannot fetch.
-        if symbol and symbol.upper() in INDEX_ETFS:
-            index_name, etf_desc = INDEX_ETFS[symbol.upper()]
-            try:
-                etf_quote = fetch_stock_quote(symbol)
-                etf_price = etf_quote.get("price", 0)
-                etf_chg   = etf_quote.get("change_pct", 0)
-            except Exception:
-                etf_price = 0
-                etf_chg   = 0
-            if etf_price > 0:
-                response_text = (
-                    f"I can show you {symbol.upper()} ({etf_desc}): "
-                    f"${etf_price} ({etf_chg:+.2f}% today).\n\n"
-                    f"Note: {symbol.upper()} tracks the {index_name} but is a different instrument - "
-                    f"its price is not the index level. I don't have a live feed for the {index_name} "
-                    f"value itself, so I won't estimate it (a rule-of-thumb multiplier would be a guess, "
-                    f"not real data). For the exact index level, check a source like Google Finance or your broker.\n\n"
-                    f"Not financial advice."
-                )
-            else:
-                response_text = (
-                    f"I track {symbol.upper()} ({etf_desc}), which follows the {index_name}, "
-                    f"but I don't currently have a live price for it, and I don't have a direct feed "
-                    f"for the {index_name} index level itself. Please check a market data source for the current value.\n\n"
-                    f"Not financial advice."
-                )
         agent = "general"
 
     # CATCH-ALL deterministic guard: no matter which agent ran, if the symbol is an
